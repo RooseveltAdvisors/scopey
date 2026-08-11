@@ -1,0 +1,3 @@
+# Scopey is a Rust project with no CI workflows configured.
+# Keep this declaration until repository CI is intentionally added.
+no_ci: true
