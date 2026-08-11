@@ -1,0 +1,3 @@
+# Scopey is a fork with zero registered workflows or CI checks.
+# Keep this declaration until CI is intentionally added.
+no_ci: true
