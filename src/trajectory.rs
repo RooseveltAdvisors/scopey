@@ -152,7 +152,7 @@ fn extract_scope_transition(output: &str) -> (String, String) {
 }
 
 fn sanitize_scope_requirements(content: &str, user_prompt: Option<&str>) -> String {
-    let mut wrapped_continuation = false;
+    let mut wrapped_continuation = None;
     let mut clean_lines = Vec::new();
     for line in content.lines() {
         let next_wrapped_continuation = is_wrapped_wrapper_prefix(line, user_prompt);
@@ -167,7 +167,7 @@ fn sanitize_scope_requirements(content: &str, user_prompt: Option<&str>) -> Stri
 fn sanitize_scope_line(
     line: &str,
     user_prompt: Option<&str>,
-    wrapped_continuation: bool,
+    wrapped_continuation: Option<&str>,
 ) -> Option<String> {
     let normalized = line.to_ascii_lowercase();
     let preserve_no_tools = user_prompt_supports(user_prompt, "no_tools");
@@ -213,8 +213,8 @@ fn sanitize_scope_line(
         return None;
     }
 
-    let mut clean = if wrapped_continuation {
-        remove_continuation_marker(line, "files")
+    let mut clean = if let Some(marker) = wrapped_continuation {
+        remove_continuation_marker(line, marker)
     } else {
         line.to_string()
     };
@@ -229,20 +229,35 @@ fn sanitize_scope_line(
             || normalized.contains("codex"));
     let has_reply_wrapper =
         normalized.contains("reply with text only") && normalized.contains("no preamble");
+    let has_incomplete_wrapper = normalized.trim_end().ends_with("do not run tools or")
+        || normalized.trim_end().ends_with("do not run tools or edit")
+        || normalized.contains("critical:")
+            && normalized.contains("do not run tools")
+            && normalized.trim_end().ends_with("edit");
 
-    if !has_scope_response && !has_critical_wrapper && !has_combined_wrapper && !has_reply_wrapper {
+    if !has_scope_response
+        && !has_critical_wrapper
+        && !has_combined_wrapper
+        && !has_reply_wrapper
+        && !has_incomplete_wrapper
+    {
         return Some(clean);
     }
 
     if has_scope_response {
         clean = remove_scope_response_marker(&clean);
     }
-    if has_critical_wrapper || has_combined_wrapper || has_reply_wrapper {
-        let incomplete_critical = normalized.contains("critical:")
-            && normalized.contains("do not run tools")
-            && normalized.trim_end().ends_with("edit");
-        if incomplete_critical {
-            clean = truncate_case_insensitive(&clean, "critical:");
+    if has_critical_wrapper || has_combined_wrapper || has_reply_wrapper || has_incomplete_wrapper {
+        if has_incomplete_wrapper && preserve_no_tools && !normalized.contains("critical:") {
+            return Some(clean);
+        }
+        if has_incomplete_wrapper {
+            let marker = if normalized.contains("critical:") {
+                "critical:"
+            } else {
+                "do not run tools"
+            };
+            clean = truncate_case_insensitive(&clean, marker);
         } else {
             clean = remove_case_insensitive(&clean, "critical:");
             if !preserve_no_tools {
@@ -274,27 +289,78 @@ fn user_prompt_supports(user_prompt: Option<&str>, kind: &str) -> bool {
     };
     let normalized = prompt.to_ascii_lowercase();
     match kind {
-        "no_tools" => {
-            normalized.contains("do not run tools")
-                || normalized.contains("do not use tools")
-                || normalized.contains("no tools")
-                || normalized.contains("read-only")
-                || normalized.contains("read only")
-        }
-        "reply" => normalized.contains("reply with text only") || normalized.contains("text only"),
-        "preamble" => normalized.contains("no preamble about being codex"),
+        "no_tools" => last_constraint_signal(
+            &normalized,
+            &[
+                "do not run tools",
+                "do not use tools",
+                "no tools",
+                "read-only",
+                "read only",
+            ],
+            &[
+                "not read-only",
+                "not read only",
+                "no read-only requirement",
+                "no read only requirement",
+                "read-only boundary is not required",
+                "read only boundary is not required",
+                "rejects a read-only",
+                "reject a read-only",
+                "tools are allowed",
+                "tools may be used",
+            ],
+        ),
+        "reply" => last_constraint_signal(
+            &normalized,
+            &["reply with text only", "text only"],
+            &[
+                "not text only",
+                "text only is not required",
+                "do not require text only",
+            ],
+        ),
+        "preamble" => last_constraint_signal(
+            &normalized,
+            &["no preamble about being codex"],
+            &["no preamble about being codex is not required"],
+        ),
         _ => false,
     }
 }
 
-fn is_wrapped_wrapper_prefix(line: &str, user_prompt: Option<&str>) -> bool {
+fn last_constraint_signal(text: &str, positive: &[&str], negative: &[&str]) -> bool {
+    let positive_at = positive
+        .iter()
+        .filter_map(|phrase| text.rfind(phrase))
+        .max();
+    let negative_at = negative
+        .iter()
+        .filter_map(|phrase| text.rfind(phrase))
+        .max();
+    match (positive_at, negative_at) {
+        (Some(positive_at), Some(negative_at)) => positive_at > negative_at,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn is_wrapped_wrapper_prefix(line: &str, user_prompt: Option<&str>) -> Option<&'static str> {
     if user_prompt_supports(user_prompt, "no_tools") {
-        return false;
+        return None;
     }
     let normalized = line.to_ascii_lowercase();
-    normalized.contains("critical:")
-        && normalized.contains("do not run tools")
-        && normalized.trim_end().ends_with("edit")
+    if normalized.trim_end().ends_with("do not run tools or") {
+        Some("edit files")
+    } else if normalized.trim_end().ends_with("do not run tools or edit")
+        || (normalized.contains("critical:")
+            && normalized.contains("do not run tools")
+            && normalized.trim_end().ends_with("edit"))
+    {
+        Some("files")
+    } else {
+        None
+    }
 }
 
 fn remove_case_insensitive(input: &str, phrase: &str) -> String {
@@ -427,7 +493,7 @@ pub fn summarize_scope(
             ("FALLBACK_LATEST".into(), fallback_scope(latest_prompt))
         }
     };
-    let out = sanitize_scope_requirements(&extracted_scope, Some(latest_prompt));
+    let out = sanitize_scope_requirements(&extracted_scope, Some(&joined));
     let out = if out.is_empty() {
         fallback_scope(latest_prompt)
     } else {
@@ -511,10 +577,12 @@ pub fn judge_window(
         store.upsert_judgement(pending);
         store.persist()?;
 
-        let last_user = store.all_user_prompts().last().cloned().unwrap_or_default();
+        let prompts = store.all_user_prompts();
+        let user_context = prompts.join("\n\n---\n\n");
+        let last_user = prompts.last().cloned().unwrap_or_default();
         let scope = store
             .latest_scope_requirements()
-            .map(|scope| sanitize_scope_requirements(&scope, Some(&last_user)))
+            .map(|scope| sanitize_scope_requirements(&scope, Some(&user_context)))
             .filter(|scope| !scope.is_empty())
             .unwrap_or_else(|| {
                 if last_user.trim().is_empty() {
@@ -1288,6 +1356,8 @@ mod tests {
 files. Reply with text only. No preamble about being Codex.\n\
 - CRITICAL:\n\
 - Do not run tools\n\
+- Do not run tools or\n\
+edit files. Reply with text only. No preamble about being Codex.\n\
 - Reply with text only\n\
 - No preamble about being Codex\n\
 - The user explicitly requires: do not run tools during this read-only review.\n\
@@ -1327,6 +1397,31 @@ files. Reply with text only. No preamble about being Codex.\n\
             sanitize_scope_requirements(constraint, Some(prompt)),
             constraint
         );
+    }
+
+    #[test]
+    fn earlier_active_constraint_is_preserved_from_full_prompt_context() {
+        let constraint = "- Do not run tools or edit files. Reply with text only.";
+        let prompts =
+            "Do not run tools or edit files. Reply with text only.\n\nContinue the review.";
+
+        assert_eq!(
+            sanitize_scope_requirements(constraint, Some(prompts)),
+            constraint
+        );
+    }
+
+    #[test]
+    fn negated_read_only_boundary_does_not_preserve_wrapper() {
+        let poisoned = "- Keep editing the payment-link fix. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+        let prompt = "Do not impose a read-only boundary; tools are allowed for this task.";
+
+        let clean = sanitize_scope_requirements(poisoned, Some(prompt));
+
+        assert!(clean.contains("Keep editing the payment-link fix"));
+        assert!(!clean.contains("Do not run tools or edit files"));
+        assert!(!clean.contains("Reply with text only"));
+        assert!(!clean.contains("No preamble about being Codex"));
     }
 
     #[test]
