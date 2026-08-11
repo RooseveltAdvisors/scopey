@@ -1,3 +1,3 @@
-# Scopey is a fork with zero registered workflows or CI checks.
-# Keep this declaration until CI is intentionally added.
+# Scopey has no checks registered with no-mistakes.
+# Existing GitHub workflows are outside this declaration.
 no_ci: true
