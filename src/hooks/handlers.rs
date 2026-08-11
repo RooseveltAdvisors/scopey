@@ -4,8 +4,8 @@ use crate::guard::{self, SessionJobGuard};
 use crate::session::{hash_prompt, SessionMessage, SessionStore, ToolEvent};
 use crate::tool_journal::{counts_toward_n, preview_tool_input};
 use crate::trajectory::{
-    build_correction_injection, build_reminder_injection, drain_pending_jobs,
-    spawn_background_judge, spawn_background_summarize, transcript_len,
+    build_correction_injection_with_prompt, build_reminder_injection_with_prompt,
+    drain_pending_jobs, spawn_background_judge, spawn_background_summarize, transcript_len,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -658,6 +658,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
     }
     let count = store.data.tool_call_count;
     let delta = meaningful_delta;
+    let latest_user_prompt = store.all_user_prompts().last().cloned();
 
     let n = cfg.n_tool_calls.max(1);
     let m = cfg.m_reminder.max(1);
@@ -689,12 +690,13 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
             .verdict
             .clone()
             .unwrap_or(crate::session::JudgementVerdict::Unknown);
-        let text = build_correction_injection(
+        let text = build_correction_injection_with_prompt(
             &scope,
             &summary,
             &details,
             &verdict,
             cfg.ascii_scopey_on_correction,
+            latest_user_prompt.as_deref(),
         );
         if let Some(id) = j.id.as_deref() {
             store.mark_judgement_injected(id);
@@ -718,7 +720,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
     // 2) Periodic scope reminder
     if !injected && count > 0 && count % m == 0 && store.data.last_reminder_at_count != count {
         if let Some(scope) = store.latest_scope_requirements() {
-            let text = build_reminder_injection(&scope);
+            let text = build_reminder_injection_with_prompt(&scope, latest_user_prompt.as_deref());
             store.append(SessionMessage::injection("reminder", &text, count));
             store.data.last_reminder_at_count = count;
             store.data.last_injection_at_count = count;
@@ -841,6 +843,7 @@ pub fn stop(cfg: &Config) -> Result<()> {
     }
 
     let count = store.data.tool_call_count;
+    let latest_user_prompt = store.all_user_prompts().last().cloned();
     let max_lag = if cfg.judgement_max_lag_tools == 0 {
         cfg.n_tool_calls.saturating_mul(2).max(30)
     } else {
@@ -858,12 +861,13 @@ pub fn stop(cfg: &Config) -> Result<()> {
             .verdict
             .clone()
             .unwrap_or(crate::session::JudgementVerdict::Unknown);
-        let text = build_correction_injection(
+        let text = build_correction_injection_with_prompt(
             &scope,
             &summary,
             &details,
             &verdict,
             cfg.ascii_scopey_on_correction,
+            latest_user_prompt.as_deref(),
         );
         if let Some(id) = j.id.as_deref() {
             store.mark_judgement_injected(id);
