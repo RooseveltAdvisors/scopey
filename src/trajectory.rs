@@ -216,7 +216,7 @@ fn sanitize_scope_line(
     }
 
     let mut clean = if let Some(marker) = wrapped_continuation {
-        remove_continuation_marker(line, marker)
+        remove_continuation_marker(line, marker, preserve_no_tools)
     } else {
         line.to_string()
     };
@@ -234,6 +234,8 @@ fn sanitize_scope_line(
     let has_incomplete_wrapper = normalized.trim_end().ends_with("do not run tools")
         || normalized.trim_end().ends_with("do not run tools or")
         || normalized.trim_end().ends_with("do not run tools or edit")
+        || normalized.trim_end().ends_with("do not run")
+        || normalized.trim_end().ends_with("do not")
         || normalized.contains("critical:")
             && normalized.contains("do not run tools")
             && normalized.trim_end().ends_with("edit");
@@ -292,6 +294,12 @@ fn user_prompt_supports(user_prompt: Option<&str>, kind: &str) -> bool {
     let Some(prompt) = user_prompt else {
         return false;
     };
+    let supports_no_tools = prompt
+        .split(|ch: char| ch == '.' || ch == '!' || ch == '?' || ch == '\n')
+        .any(|segment| user_constraint_segment_supports(segment, "no_tools"));
+    if matches!(kind, "reply" | "preamble") && !supports_no_tools {
+        return false;
+    }
     prompt
         .split(|ch: char| ch == '.' || ch == '!' || ch == '?' || ch == '\n')
         .any(|segment| user_constraint_segment_supports(segment, kind))
@@ -403,6 +411,10 @@ fn is_wrapped_wrapper_prefix(line: &str) -> Option<&'static str> {
         Some("edit files")
     } else if normalized.trim_end().ends_with("do not run tools") {
         Some("or edit files")
+    } else if normalized.trim_end().ends_with("do not run") {
+        Some("tools or edit files")
+    } else if normalized.trim_end().ends_with("do not") {
+        Some("run tools or edit files")
     } else if normalized.trim_end().ends_with("do not run tools or edit")
         || (normalized.contains("critical:")
             && normalized.contains("do not run tools")
@@ -449,9 +461,17 @@ fn strip_incomplete_wrapper_suffix(input: &str) -> String {
     trimmed.to_string()
 }
 
-fn remove_continuation_marker(input: &str, marker: &str) -> String {
+fn remove_continuation_marker(input: &str, marker: &str, preserve_no_tools: bool) -> String {
     let leading = input.len() - input.trim_start().len();
     let trimmed = &input[leading..];
+    if preserve_no_tools && (marker == "tools or edit files" || marker == "run tools or edit files")
+    {
+        let suffix = " or edit files";
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(offset) = lower.find(suffix) {
+            return format!("{}{}", &input[..leading], &trimmed[..offset]);
+        }
+    }
     if trimmed
         .get(..marker.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
@@ -576,7 +596,7 @@ pub fn summarize_scope(
             ("FALLBACK_LATEST".into(), fallback_scope(latest_prompt))
         }
     };
-    let out = sanitize_scope_requirements(&extracted_scope, Some(&joined));
+    let out = sanitize_scope_requirements(&extracted_scope, Some(latest_prompt));
     let out = if out.is_empty() {
         fallback_scope(latest_prompt)
     } else {
@@ -660,12 +680,10 @@ pub fn judge_window(
         store.upsert_judgement(pending);
         store.persist()?;
 
-        let prompts = store.all_user_prompts();
-        let user_context = prompts.join("\n\n---\n\n");
-        let last_user = prompts.last().cloned().unwrap_or_default();
+        let last_user = store.all_user_prompts().last().cloned().unwrap_or_default();
         let scope = store
             .latest_scope_requirements()
-            .map(|scope| sanitize_scope_requirements(&scope, Some(&user_context)))
+            .map(|scope| sanitize_scope_requirements(&scope, Some(&last_user)))
             .filter(|scope| !scope.is_empty())
             .unwrap_or_else(|| {
                 if last_user.trim().is_empty() {
@@ -1485,14 +1503,13 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
-    fn earlier_active_constraint_is_preserved_from_full_prompt_context() {
+    fn obsolete_constraint_is_not_preserved_from_historical_prompt_context() {
         let constraint = "- Do not run tools or edit files. Reply with text only.";
-        let prompts =
-            "Do not run tools or edit files. Reply with text only.\n\nContinue the review.";
+        let latest_prompt = "Continue the review with shell and file edits.";
 
         assert_eq!(
-            sanitize_scope_requirements(constraint, Some(prompts)),
-            constraint
+            sanitize_scope_requirements(constraint, Some(latest_prompt)),
+            ""
         );
     }
 
@@ -1519,6 +1536,8 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         assert!(clean.contains("Keep editing the payment-link fix"));
         assert!(!clean.contains("CRITICAL:"));
         assert!(!clean.contains("Do not run tools or edit files"));
+        assert!(!clean.contains("Reply with text only"));
+        assert!(!clean.contains("No preamble about being Codex"));
     }
 
     #[test]
@@ -1532,8 +1551,26 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn read_only_context_removes_wrapper_split_after_run() {
+        let wrapped = "- Do not run\ntools or edit files. Reply with text only. No preamble about being Codex.";
+        let prompt = "This is a read-only review; preserve that constraint.";
+
+        let clean = sanitize_scope_requirements(wrapped, Some(prompt));
+
+        assert_eq!(clean, "- Do not run\ntools");
+    }
+
+    #[test]
     fn genuine_scope_response_requirement_is_untouched() {
         let requirement = "- Preserve the scope-extraction response verbatim for the audit.";
+
+        assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
+    }
+
+    #[test]
+    fn scope_response_summary_requirement_is_untouched() {
+        let requirement =
+            "The scope-extraction response should summarize the active scope accurately.";
 
         assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
     }

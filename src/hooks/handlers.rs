@@ -658,7 +658,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
     }
     let count = store.data.tool_call_count;
     let delta = meaningful_delta;
-    let user_context = store.all_user_prompts().join("\n\n---\n\n");
+    let latest_user_prompt = store.all_user_prompts().last().cloned();
 
     let n = cfg.n_tool_calls.max(1);
     let m = cfg.m_reminder.max(1);
@@ -696,7 +696,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
             &details,
             &verdict,
             cfg.ascii_scopey_on_correction,
-            Some(&user_context),
+            latest_user_prompt.as_deref(),
         );
         if let Some(id) = j.id.as_deref() {
             store.mark_judgement_injected(id);
@@ -720,7 +720,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
     // 2) Periodic scope reminder
     if !injected && count > 0 && count % m == 0 && store.data.last_reminder_at_count != count {
         if let Some(scope) = store.latest_scope_requirements() {
-            let text = build_reminder_injection_with_prompt(&scope, Some(&user_context));
+            let text = build_reminder_injection_with_prompt(&scope, latest_user_prompt.as_deref());
             store.append(SessionMessage::injection("reminder", &text, count));
             store.data.last_reminder_at_count = count;
             store.data.last_injection_at_count = count;
@@ -843,7 +843,7 @@ pub fn stop(cfg: &Config) -> Result<()> {
     }
 
     let count = store.data.tool_call_count;
-    let user_context = store.all_user_prompts().join("\n\n---\n\n");
+    let latest_user_prompt = store.all_user_prompts().last().cloned();
     let max_lag = if cfg.judgement_max_lag_tools == 0 {
         cfg.n_tool_calls.saturating_mul(2).max(30)
     } else {
@@ -867,7 +867,7 @@ pub fn stop(cfg: &Config) -> Result<()> {
             &details,
             &verdict,
             cfg.ascii_scopey_on_correction,
-            Some(&user_context),
+            latest_user_prompt.as_deref(),
         );
         if let Some(id) = j.id.as_deref() {
             store.mark_judgement_injected(id);
