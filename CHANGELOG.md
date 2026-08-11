@@ -7,6 +7,16 @@ and the project intends to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Course corrections now preserve work instead of demanding immediate
+  re-alignment. The injected correction tells the agent to pause, then report
+  what it was doing, why it was judged out of scope, the current state
+  including changes already made, and the exact next step it would take —
+  then ask permission and wait. Flagged work continues only with user
+  approval, and completed work is never undone, discarded, or overwritten
+  unless the user explicitly asks for a revert.
+
 ## [0.2.0] - 2026-08-05
 
 ### Added
