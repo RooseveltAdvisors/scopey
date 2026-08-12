@@ -369,7 +369,7 @@ fn find_ascii_phrase(value: &str, phrase: &str, from: usize) -> Option<(usize, u
     let ends_at_boundary = value[end..]
         .chars()
         .next()
-        .map_or(true, |ch| !ch.is_ascii_alphanumeric());
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
     if starts_at_boundary && ends_at_boundary {
         Some((start, end))
     } else {

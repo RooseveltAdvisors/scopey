@@ -264,11 +264,16 @@ Machine-generated task notifications are treated as context, not new user
 goals. Each transition is written to the structured
 session log as `job.summarize.transition`, including the operation and
 before/after scope hashes. The scope-analysis prompt directs the model not to
-invent planning-only, no-tool, no-edit, or similar permission boundaries. Judge
-windows are bound to one user-prompt epoch; a new prompt invalidates pending
-verdicts and restarts the tool window so old work is never judged against a
-newer scope. If the summarizer model is unavailable, the fallback preserves
-only the latest request instead of replaying the full prompt history.
+invent planning-only, no-tool, no-edit, or similar permission boundaries. Scope
+requirements are sanitized both when extracted scope is persisted and before it
+reaches a judge or injection: untrusted analyst-wrapper controls are removed,
+while explicitly user-authored no-tool, read-only, or similar constraints are
+preserved. Corrections and reminders are advisory and do not prohibit
+on-mission tools or edits. Judge windows are bound to one user-prompt epoch; a
+new prompt invalidates pending verdicts and restarts the tool window so old work
+is never judged against a newer scope. If the summarizer model is unavailable,
+the fallback preserves only the latest request instead of replaying the full
+prompt history.
 
 ### Development checks
 
