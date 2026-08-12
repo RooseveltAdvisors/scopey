@@ -118,17 +118,23 @@ fn recent_prompt_context(prompts: &[String], max_chars: usize) -> String {
     clip(&numbered, max_chars)
 }
 
-fn fallback_scope(latest_prompt: &str, previous_scope: Option<&str>) -> String {
-    let active_prompt = active_scope_prompt(previous_scope, latest_prompt);
+fn fallback_scope_with_user_prompts(
+    latest_prompt: &str,
+    previous_scope: Option<&str>,
+    user_prompts: &[String],
+) -> String {
+    let active_prompt = if user_prompts.is_empty() {
+        active_scope_prompt(previous_scope, latest_prompt)
+    } else {
+        active_user_prompt_context(user_prompts, latest_prompt)
+    };
     let latest_scope = sanitize_scope_requirements(latest_prompt, Some(latest_prompt));
     let previous_scope = previous_scope
         .filter(|scope| !scope.trim().is_empty())
         .map(|scope| sanitize_scope_requirements(scope, Some(&active_prompt)))
         .filter(|scope| !scope.is_empty());
     let prompt = if let Some(previous_scope) = previous_scope {
-        if latest_prompt_releases_no_tools(latest_prompt)
-            || latest_prompt_replaces_scope(latest_prompt)
-        {
+        if latest_prompt_replaces_scope(latest_prompt) {
             latest_scope
         } else if latest_scope.is_empty() {
             previous_scope
@@ -148,6 +154,14 @@ fn fallback_scope(latest_prompt: &str, previous_scope: Option<&str>) -> String {
         crate::session::FALLBACK_SCOPE_MARKER,
         clip(prompt, 1500)
     )
+}
+
+fn active_user_prompt_context(user_prompts: &[String], latest_prompt: &str) -> String {
+    if latest_prompt_releases_no_tools(latest_prompt) || user_prompts.is_empty() {
+        latest_prompt.to_string()
+    } else {
+        user_prompts.join("\n\n")
+    }
 }
 
 fn latest_prompt_replaces_scope(prompt: &str) -> bool {
@@ -219,23 +233,6 @@ fn active_scope_prompt(previous_scope: Option<&str>, latest_prompt: &str) -> Str
     format!("{previous_scope}\n{latest_prompt}")
 }
 
-fn active_scope_prompt_with_user_prompts(
-    previous_scope: Option<&str>,
-    latest_prompt: &str,
-    user_prompts: &[String],
-) -> String {
-    if latest_prompt_releases_no_tools(latest_prompt) {
-        return latest_prompt.to_string();
-    }
-    let Some(previous_scope) = previous_scope
-        .filter(|scope| !scope.trim().is_empty())
-        .and_then(|scope| safe_active_scope_context_with_user_prompts(scope, user_prompts))
-    else {
-        return latest_prompt.to_string();
-    };
-    format!("{previous_scope}\n{latest_prompt}")
-}
-
 fn safe_active_scope_context(scope: &str) -> Option<String> {
     let safe = scope
         .lines()
@@ -254,35 +251,6 @@ fn safe_active_scope_context(scope: &str) -> Option<String> {
     (!safe.is_empty()).then_some(safe)
 }
 
-fn safe_active_scope_context_with_user_prompts(
-    scope: &str,
-    user_prompts: &[String],
-) -> Option<String> {
-    let safe = scope
-        .lines()
-        .filter(|line| {
-            let normalized = line.to_ascii_lowercase();
-            if normalized.contains("critical:") {
-                return false;
-            }
-            if explicit_no_tools_constraint(&normalized)
-                && normalized.contains("reply with text only")
-                && normalized.contains("no preamble about being codex")
-            {
-                return user_prompts.iter().any(|prompt| {
-                    user_prompt_supports(Some(prompt), "no_tools")
-                        && user_prompt_supports(Some(prompt), "reply")
-                        && user_prompt_supports(Some(prompt), "preamble")
-                });
-            }
-            (explicit_no_tools_constraint(&normalized) || normalized.contains("read-only"))
-                && !normalized.contains("scope-extraction")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!safe.is_empty()).then_some(safe)
-}
-
 pub(crate) fn sanitized_scope_requirements_for_injection(
     store: &SessionStore,
     latest_user_prompt: Option<&str>,
@@ -292,7 +260,7 @@ pub(crate) fn sanitized_scope_requirements_for_injection(
     let latest = latest_user_prompt
         .or_else(|| user_prompts.last().map(String::as_str))
         .unwrap_or_default();
-    let active_prompt = active_scope_prompt_with_user_prompts(Some(&scope), latest, &user_prompts);
+    let active_prompt = active_user_prompt_context(&user_prompts, latest);
     let clean = sanitize_scope_requirements(&scope, Some(&active_prompt));
     (!clean.trim().is_empty()).then_some(clean)
 }
@@ -407,6 +375,11 @@ fn sanitize_scope_line(
         line.to_string()
     };
     let normalized = clean.to_ascii_lowercase();
+    let starts_with_critical = normalized
+        .trim_start()
+        .trim_start_matches(['-', '*', '>', '`'])
+        .trim_start()
+        .starts_with("critical:");
     let has_scope_response = scope_response_is_wrapper(&clean);
     let has_critical_wrapper = normalized.contains("critical:")
         && normalized.contains("do not run tools")
@@ -415,9 +388,11 @@ fn sanitize_scope_line(
         && (normalized.contains("reply with text only")
             || normalized.contains("no preamble")
             || normalized.contains("codex"));
-    let has_partial_critical_wrapper = normalized.trim_start().starts_with("critical:")
+    let has_partial_critical_wrapper = starts_with_critical
         && (normalized.contains("reply with text only")
             || normalized.contains("no preamble about being codex"));
+    let has_partial_critical_no_tools =
+        starts_with_critical && explicit_no_tools_constraint(&normalized);
     let has_reply_wrapper =
         normalized.contains("reply with text only") && normalized.contains("no preamble");
     let has_preamble_wrapper =
@@ -425,7 +400,9 @@ fn sanitize_scope_line(
     let has_split_preamble = normalized.trim_end().ends_with("no preamble about being");
     let has_split_scope_response = normalized.trim_end().ends_with("scope-extraction");
     let has_incomplete_wrapper = normalized.trim_end().ends_with("do not run tools")
+        || normalized.trim_end().ends_with("don't run tools")
         || normalized.trim_end().ends_with("do not run tools or")
+        || normalized.trim_end().ends_with("don't run tools or")
         || normalized.trim_end().ends_with("do not run tools or edit")
         || normalized.trim_end().ends_with("do not run")
         || normalized.trim_end().ends_with("do not")
@@ -439,6 +416,7 @@ fn sanitize_scope_line(
     if !has_scope_response
         && !has_critical_wrapper
         && !has_partial_critical_wrapper
+        && !has_partial_critical_no_tools
         && !has_combined_wrapper
         && !has_reply_wrapper
         && !has_preamble_wrapper
@@ -453,6 +431,7 @@ fn sanitize_scope_line(
     }
     if has_critical_wrapper
         || has_partial_critical_wrapper
+        || has_partial_critical_no_tools
         || has_combined_wrapper
         || has_reply_wrapper
         || has_preamble_wrapper
@@ -736,7 +715,11 @@ fn last_constraint_signal(text: &str, positive: &[&str], negative: &[&str]) -> b
 
 fn is_wrapped_wrapper_prefix(line: &str) -> Option<&'static str> {
     let normalized = line.to_ascii_lowercase();
-    if normalized.trim_end().ends_with("do not run tools or") {
+    if normalized.trim_end().ends_with("don't run tools or") {
+        Some("edit files")
+    } else if normalized.trim_end().ends_with("don't run tools") {
+        Some("or edit files")
+    } else if normalized.trim_end().ends_with("do not run tools or") {
         Some("edit files")
     } else if normalized.trim_end().ends_with("do not run tools") {
         Some("or edit files")
@@ -771,6 +754,7 @@ fn is_reply_split_candidate(normalized: &str) -> bool {
     let wrapper_context = normalized.contains("critical:")
         || normalized.contains("no preamble")
         || normalized.contains("do not run tools")
+        || normalized.contains("don't run tools")
         || normalized.trim_start().starts_with("reply with");
     wrapper_context
         && (normalized.ends_with("reply with") || normalized.ends_with("reply with text"))
@@ -779,6 +763,8 @@ fn is_reply_split_candidate(normalized: &str) -> bool {
 fn normalize_wrapper_whitespace(input: &str) -> String {
     let mut normalized = input.to_string();
     for phrase in [
+        "don't run tools or edit files",
+        "don't run tools",
         "do not run tools or edit files",
         "do not run tools",
         "reply with text only",
@@ -1043,15 +1029,18 @@ pub fn summarize_scope(
             );
             (
                 "FALLBACK_LATEST".into(),
-                fallback_scope(latest_prompt, previous_scope.as_deref()),
+                fallback_scope_with_user_prompts(
+                    latest_prompt,
+                    previous_scope.as_deref(),
+                    &prompts,
+                ),
             )
         }
     };
-    let active_prompt =
-        active_scope_prompt_with_user_prompts(previous_scope.as_deref(), latest_prompt, &prompts);
+    let active_prompt = active_user_prompt_context(&prompts, latest_prompt);
     let out = sanitize_scope_requirements(&extracted_scope, Some(&active_prompt));
     let out = if out.is_empty() {
-        fallback_scope(latest_prompt, previous_scope.as_deref())
+        fallback_scope_with_user_prompts(latest_prompt, previous_scope.as_deref(), &prompts)
     } else {
         out
     };
@@ -1897,7 +1886,8 @@ mod tests {
 
     #[test]
     fn fallback_uses_only_latest_request() {
-        let fallback = fallback_scope("when config is missing, what happens?", None);
+        let fallback =
+            fallback_scope_with_user_prompts("when config is missing, what happens?", None, &[]);
         assert!(fallback.contains("Respond only to the latest user request"));
         assert!(fallback.contains("what happens?"));
         assert!(!fallback.contains("Implement config bootstrapping"));
@@ -1905,9 +1895,10 @@ mod tests {
 
     #[test]
     fn fallback_does_not_reinject_wrapper_prompt() {
-        let fallback = fallback_scope(
+        let fallback = fallback_scope_with_user_prompts(
             "CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex.",
             None,
+            &[],
         );
 
         assert!(!fallback.contains("CRITICAL:"));
@@ -1918,20 +1909,53 @@ mod tests {
 
     #[test]
     fn fallback_retains_previous_active_constraint_on_silent_update() {
-        let fallback = fallback_scope("Continue the review.", Some("- Do not run tools."));
+        let fallback = fallback_scope_with_user_prompts(
+            "Continue the review.",
+            Some("- Do not run tools."),
+            &[],
+        );
 
         assert!(fallback.contains("Do not run tools"));
     }
 
     #[test]
     fn fallback_discards_previous_scope_for_unrelated_request() {
-        let fallback = fallback_scope(
+        let fallback = fallback_scope_with_user_prompts(
             "Start an unrelated README task.",
             Some("- Continue the payment-link fix."),
+            &[],
         );
 
         assert!(!fallback.contains("payment-link"));
         assert!(fallback.contains("README"));
+    }
+
+    #[test]
+    fn fallback_retains_unrelated_scope_when_tools_are_authorized() {
+        let fallback = fallback_scope_with_user_prompts(
+            "Continue with shell and file edits.",
+            Some("- Fix SMS-005.\n- Do not run tools."),
+            &[],
+        );
+
+        assert!(fallback.contains("Fix SMS-005"));
+        assert!(!fallback.contains("Do not run tools"));
+    }
+
+    #[test]
+    fn fallback_preserves_historical_user_wrapper_constraint() {
+        let constraint =
+            "- Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+        let prompts = vec![
+            "The user explicitly requires: Do not run tools or edit files. Reply with text only. No preamble about being Codex.".to_string(),
+            "Continue the review.".to_string(),
+        ];
+        let fallback =
+            fallback_scope_with_user_prompts("Continue the review.", Some(constraint), &prompts);
+
+        assert!(fallback.contains("Do not run tools or edit files"));
+        assert!(fallback.contains("Reply with text only"));
+        assert!(fallback.contains("No preamble about being Codex"));
     }
 
     #[test]
@@ -2036,11 +2060,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         let prompts = vec![
             "The user explicitly requires: Do not run tools or edit files. Reply with text only. No preamble about being Codex.".to_string(),
         ];
-        let active_prompt = active_scope_prompt_with_user_prompts(
-            Some(constraint),
-            "Continue the review.",
-            &prompts,
-        );
+        let active_prompt = active_user_prompt_context(&prompts, "Continue the review.");
         let clean = sanitize_scope_requirements(constraint, Some(&active_prompt));
 
         assert_eq!(clean, constraint);
@@ -2181,6 +2201,25 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         let clean = sanitize_scope_requirements(wrapped, Some(prompt));
 
         assert_eq!(clean, "- Do not run tools.");
+    }
+
+    #[test]
+    fn contraction_wrapper_split_is_removed() {
+        let wrapped = "- Don't run tools or\nedit files. Reply with text only. No preamble about being Codex.";
+        let prompt = "This is a read-only review; preserve that constraint.";
+
+        assert_eq!(
+            sanitize_scope_requirements(wrapped, Some(prompt)),
+            "- Do not run tools."
+        );
+    }
+
+    #[test]
+    fn partial_critical_tool_wrapper_is_removed() {
+        assert_eq!(
+            sanitize_scope_requirements("- CRITICAL: Do not run tools.", None),
+            ""
+        );
     }
 
     #[test]
