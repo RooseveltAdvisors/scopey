@@ -4,7 +4,7 @@ use crate::guard::{self, SessionJobGuard};
 use crate::session::{hash_prompt, SessionMessage, SessionStore, ToolEvent};
 use crate::tool_journal::{counts_toward_n, preview_tool_input};
 use crate::trajectory::{
-    build_correction_injection_with_prompt, build_reminder_injection_with_prompt,
+    build_correction_injection_from_sanitized_scope, build_reminder_injection_from_sanitized_scope,
     drain_pending_jobs, sanitized_scope_requirements_for_injection, spawn_background_judge,
     spawn_background_summarize, transcript_len,
 };
@@ -691,13 +691,12 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
             .verdict
             .clone()
             .unwrap_or(crate::session::JudgementVerdict::Unknown);
-        let text = build_correction_injection_with_prompt(
+        let text = build_correction_injection_from_sanitized_scope(
             &scope,
             &summary,
             &details,
             &verdict,
             cfg.ascii_scopey_on_correction,
-            latest_user_prompt.as_deref(),
         );
         if let Some(id) = j.id.as_deref() {
             store.mark_judgement_injected(id);
@@ -723,7 +722,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
         if let Some(scope) =
             sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
         {
-            let text = build_reminder_injection_with_prompt(&scope, latest_user_prompt.as_deref());
+            let text = build_reminder_injection_from_sanitized_scope(&scope);
             store.append(SessionMessage::injection("reminder", &text, count));
             store.data.last_reminder_at_count = count;
             store.data.last_injection_at_count = count;
@@ -864,13 +863,12 @@ pub fn stop(cfg: &Config) -> Result<()> {
             .verdict
             .clone()
             .unwrap_or(crate::session::JudgementVerdict::Unknown);
-        let text = build_correction_injection_with_prompt(
+        let text = build_correction_injection_from_sanitized_scope(
             &scope,
             &summary,
             &details,
             &verdict,
             cfg.ascii_scopey_on_correction,
-            latest_user_prompt.as_deref(),
         );
         if let Some(id) = j.id.as_deref() {
             store.mark_judgement_injected(id);

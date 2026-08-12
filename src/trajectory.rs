@@ -126,7 +126,9 @@ fn fallback_scope(latest_prompt: &str, previous_scope: Option<&str>) -> String {
         .map(|scope| sanitize_scope_requirements(scope, Some(&active_prompt)))
         .filter(|scope| !scope.is_empty());
     let prompt = if let Some(previous_scope) = previous_scope {
-        if latest_prompt_releases_no_tools(latest_prompt) {
+        if latest_prompt_releases_no_tools(latest_prompt)
+            || latest_prompt_replaces_scope(latest_prompt)
+        {
             latest_scope
         } else if latest_scope.is_empty() {
             previous_scope
@@ -146,6 +148,23 @@ fn fallback_scope(latest_prompt: &str, previous_scope: Option<&str>) -> String {
         crate::session::FALLBACK_SCOPE_MARKER,
         clip(prompt, 1500)
     )
+}
+
+fn latest_prompt_replaces_scope(prompt: &str) -> bool {
+    let normalized = normalize_wrapper_whitespace(prompt).to_ascii_lowercase();
+    [
+        "unrelated",
+        "start a new task",
+        "new task",
+        "switch to",
+        "instead,",
+        "instead of",
+        "replace the previous",
+        "forget the previous",
+        "different task",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn extract_scope_transition(output: &str) -> (String, String) {
@@ -174,6 +193,7 @@ fn extract_scope_transition(output: &str) -> (String, String) {
 }
 
 fn sanitize_scope_requirements(content: &str, user_prompt: Option<&str>) -> String {
+    let content = normalize_wrapper_whitespace(content);
     let mut wrapped_continuation = None;
     let mut clean_lines = Vec::new();
     for line in content.lines() {
@@ -221,7 +241,7 @@ fn safe_active_scope_context(scope: &str) -> Option<String> {
         .lines()
         .filter(|line| {
             let normalized = line.to_ascii_lowercase();
-            (normalized.contains("do not run tools") || normalized.contains("read-only"))
+            (explicit_no_tools_constraint(&normalized) || normalized.contains("read-only"))
                 && !normalized.contains("critical:")
                 && !normalized.contains("scope-extraction")
                 && !normalized.contains("reply with text only")
@@ -245,7 +265,7 @@ fn safe_active_scope_context_with_user_prompts(
             if normalized.contains("critical:") {
                 return false;
             }
-            if normalized.contains("do not run tools")
+            if explicit_no_tools_constraint(&normalized)
                 && normalized.contains("reply with text only")
                 && normalized.contains("no preamble about being codex")
             {
@@ -255,7 +275,7 @@ fn safe_active_scope_context_with_user_prompts(
                         && user_prompt_supports(Some(prompt), "preamble")
                 });
             }
-            (normalized.contains("do not run tools") || normalized.contains("read-only"))
+            (explicit_no_tools_constraint(&normalized) || normalized.contains("read-only"))
                 && !normalized.contains("scope-extraction")
         })
         .collect::<Vec<_>>()
@@ -278,7 +298,7 @@ pub(crate) fn sanitized_scope_requirements_for_injection(
 }
 
 fn latest_prompt_releases_no_tools(prompt: &str) -> bool {
-    prompt
+    normalize_wrapper_whitespace(prompt)
         .split(|ch: char| ch == '.' || ch == '!' || ch == '?' || ch == '\n')
         .any(|segment| {
             let normalized = segment.to_ascii_lowercase();
@@ -286,11 +306,10 @@ fn latest_prompt_releases_no_tools(prompt: &str) -> bool {
             {
                 return false;
             }
-            if normalized.contains("do not use tools")
-                || normalized.contains("do not edit files")
-                || normalized.contains("don't use tools")
-                || normalized.contains("don't edit files")
-            {
+            if descriptive_wrapper_text(&normalized) {
+                return false;
+            }
+            if explicit_no_tools_constraint(&normalized) {
                 return false;
             }
             normalized.contains("tools are allowed")
@@ -313,8 +332,7 @@ fn sanitize_scope_line(
         wrapped_continuation.is_none() && user_prompt_supports(user_prompt, "reply");
     let preserve_preamble =
         wrapped_continuation.is_none() && user_prompt_supports(user_prompt, "preamble");
-    let line_has_no_tools = normalized.contains("do not run tools")
-        || normalized.contains("do not run tools or edit files");
+    let line_has_no_tools = explicit_no_tools_constraint(&normalized);
     let line_has_reply = normalized.contains("reply with text only");
     let line_has_preamble = normalized.contains("no preamble about being codex");
     if line_has_no_tools
@@ -332,8 +350,23 @@ fn sanitize_scope_line(
         .trim_start_matches(['-', '*', '`'])
         .trim()
         .trim_matches(|ch: char| ch.is_whitespace() || ".,:;!?`".contains(ch));
-    if fragment == "do not run tools" && preserve_no_tools
-        || fragment == "do not run tools or edit files" && preserve_no_tools
+    if matches!(
+        fragment,
+        "do not run tools"
+            | "do not run tools or edit files"
+            | "don't run tools"
+            | "don't run tools or edit files"
+            | "never run tools"
+            | "never run tools or edit files"
+            | "must not run tools"
+            | "mustn't run tools"
+            | "do not use tools"
+            | "don't use tools"
+            | "never use tools"
+            | "do not use shell"
+            | "don't use shell"
+            | "never use shell"
+    ) && preserve_no_tools
         || fragment == "reply with text only" && preserve_reply
         || fragment == "no preamble" && preserve_preamble
         || fragment == "no preamble about being codex" && preserve_preamble
@@ -345,6 +378,18 @@ fn sanitize_scope_line(
         "critical"
             | "do not run tools"
             | "do not run tools or edit files"
+            | "don't run tools"
+            | "don't run tools or edit files"
+            | "never run tools"
+            | "never run tools or edit files"
+            | "must not run tools"
+            | "mustn't run tools"
+            | "do not use tools"
+            | "don't use tools"
+            | "never use tools"
+            | "do not use shell"
+            | "don't use shell"
+            | "never use shell"
             | "reply with text only"
             | "no preamble"
             | "no preamble about being codex"
@@ -366,7 +411,7 @@ fn sanitize_scope_line(
     let has_critical_wrapper = normalized.contains("critical:")
         && normalized.contains("do not run tools")
         && (normalized.contains("edit files") || normalized.trim_end().ends_with("edit"));
-    let has_combined_wrapper = normalized.contains("do not run tools or edit files")
+    let has_combined_wrapper = explicit_no_tools_constraint(&normalized)
         && (normalized.contains("reply with text only")
             || normalized.contains("no preamble")
             || normalized.contains("codex"));
@@ -375,6 +420,8 @@ fn sanitize_scope_line(
             || normalized.contains("no preamble about being codex"));
     let has_reply_wrapper =
         normalized.contains("reply with text only") && normalized.contains("no preamble");
+    let has_preamble_wrapper =
+        normalized.contains("no preamble about being codex") && !preserve_preamble;
     let has_split_preamble = normalized.trim_end().ends_with("no preamble about being");
     let has_split_scope_response = normalized.trim_end().ends_with("scope-extraction");
     let has_incomplete_wrapper = normalized.trim_end().ends_with("do not run tools")
@@ -394,6 +441,7 @@ fn sanitize_scope_line(
         && !has_partial_critical_wrapper
         && !has_combined_wrapper
         && !has_reply_wrapper
+        && !has_preamble_wrapper
         && !has_incomplete_wrapper
         && wrapped_continuation.is_none()
     {
@@ -407,6 +455,7 @@ fn sanitize_scope_line(
         || has_partial_critical_wrapper
         || has_combined_wrapper
         || has_reply_wrapper
+        || has_preamble_wrapper
         || has_incomplete_wrapper
     {
         if has_incomplete_wrapper {
@@ -416,12 +465,8 @@ fn sanitize_scope_line(
                 clean = truncate_case_insensitive(&clean, "scope-extraction");
             } else if preserve_no_tools {
                 clean = remove_case_insensitive(&clean, "critical:");
-                if normalized.contains("do not run tools or edit files") {
-                    clean = replace_case_insensitive(
-                        &clean,
-                        "do not run tools or edit files",
-                        "Do not run tools",
-                    );
+                if explicit_no_tools_constraint(&normalized) {
+                    clean = normalize_no_tools_wrapper(&clean);
                     clean = remove_case_insensitive(&clean, "reply with text");
                 } else if is_reply_split_candidate(&normalized) {
                     clean = truncate_case_insensitive(&clean, "reply with");
@@ -440,14 +485,9 @@ fn sanitize_scope_line(
         } else {
             clean = remove_case_insensitive(&clean, "critical:");
             if preserve_no_tools && !preserve_reply {
-                clean = replace_case_insensitive(
-                    &clean,
-                    "do not run tools or edit files",
-                    "Do not run tools",
-                );
+                clean = normalize_no_tools_wrapper(&clean);
             } else if !preserve_no_tools {
-                clean = remove_case_insensitive(&clean, "do not run tools or edit files");
-                clean = remove_case_insensitive(&clean, "do not run tools");
+                clean = remove_no_tools_constraints(&clean);
             }
         }
         if !preserve_reply {
@@ -457,6 +497,8 @@ fn sanitize_scope_line(
             clean = remove_case_insensitive(&clean, "no preamble about being codex");
         }
     }
+
+    clean = collapse_removed_wrapper_punctuation(&clean);
 
     let remaining = clean
         .trim_start_matches(|ch: char| ch == '-' || ch == '*' || ch == '`')
@@ -468,10 +510,75 @@ fn sanitize_scope_line(
     }
 }
 
+fn collapse_removed_wrapper_punctuation(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for character in input.chars() {
+        if character == '.' {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            if output.ends_with('.') {
+                continue;
+            }
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn normalize_no_tools_wrapper(input: &str) -> String {
+    let mut output = input.to_string();
+    for phrase in [
+        "do not run tools or edit files",
+        "don't run tools or edit files",
+        "never run tools or edit files",
+        "must not run tools or edit files",
+        "mustn't run tools or edit files",
+    ] {
+        output = replace_case_insensitive(&output, phrase, "Do not run tools");
+    }
+    output
+}
+
+fn remove_no_tools_constraints(input: &str) -> String {
+    let mut output = input.to_string();
+    for phrase in [
+        "do not run tools or edit files",
+        "don't run tools or edit files",
+        "never run tools or edit files",
+        "must not run tools or edit files",
+        "mustn't run tools or edit files",
+        "do not run tools",
+        "don't run tools",
+        "never run tools",
+        "must not run tools",
+        "mustn't run tools",
+        "do not use tools",
+        "don't use tools",
+        "never use tools",
+        "must not use tools",
+        "mustn't use tools",
+        "do not use shell",
+        "don't use shell",
+        "never use shell",
+        "must not use shell",
+        "mustn't use shell",
+        "do not edit files",
+        "don't edit files",
+        "never edit files",
+        "must not edit files",
+        "mustn't edit files",
+    ] {
+        output = remove_case_insensitive(&output, phrase);
+    }
+    output
+}
+
 fn user_prompt_supports(user_prompt: Option<&str>, kind: &str) -> bool {
     let Some(prompt) = user_prompt else {
         return false;
     };
+    let prompt = normalize_wrapper_whitespace(prompt);
     let supports_no_tools = prompt
         .split(|ch: char| ch == '.' || ch == '!' || ch == '?' || ch == '\n')
         .any(|segment| user_constraint_segment_supports(segment, "no_tools"));
@@ -486,6 +593,9 @@ fn user_prompt_supports(user_prompt: Option<&str>, kind: &str) -> bool {
 fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
     let mut normalized = segment.to_ascii_lowercase();
     if normalized.contains("critical:") || normalized.contains("scope-extraction response") {
+        return false;
+    }
+    if descriptive_wrapper_text(&normalized) {
         return false;
     }
     for prefix in [
@@ -506,9 +616,7 @@ fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
         .trim();
     match kind {
         "no_tools" => {
-            (normalized.contains("do not run tools")
-                || normalized.contains("do not use tools")
-                || normalized.contains("no tools"))
+            explicit_no_tools_constraint(&normalized)
                 && !normalized.contains("tools are allowed")
                 && !normalized.contains("tools may be used")
                 && !normalized.contains("not required")
@@ -522,6 +630,48 @@ fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
         "preamble" => normalized.starts_with("no preamble about being codex"),
         _ => false,
     }
+}
+
+fn explicit_no_tools_constraint(text: &str) -> bool {
+    [
+        "do not run tools",
+        "don't run tools",
+        "never run tools",
+        "must not run tools",
+        "mustn't run tools",
+        "do not use tools",
+        "don't use tools",
+        "never use tools",
+        "must not use tools",
+        "mustn't use tools",
+        "do not use shell",
+        "don't use shell",
+        "never use shell",
+        "must not use shell",
+        "mustn't use shell",
+        "do not edit files",
+        "don't edit files",
+        "never edit files",
+        "must not edit files",
+        "mustn't edit files",
+        "no tools",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn descriptive_wrapper_text(text: &str) -> bool {
+    [
+        "wrapper says",
+        "wrapper states",
+        "wrapper reads",
+        "injected wrapper",
+        "analyzer's injected wrapper",
+        "quoted wrapper",
+        "the bug is caused by the wrapper",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn read_only_constraint_requested(text: &str) -> bool {
@@ -618,13 +768,82 @@ fn is_wrapped_wrapper_prefix(line: &str) -> Option<&'static str> {
 
 fn is_reply_split_candidate(normalized: &str) -> bool {
     let normalized = normalized.trim_end();
-    let ordinary_requirement = normalized.contains("should reply with")
-        || normalized.contains("would reply with")
-        || normalized.contains("can reply with")
-        || normalized.contains("must reply with")
-        || normalized.contains("exact answer");
-    !ordinary_requirement
+    let wrapper_context = normalized.contains("critical:")
+        || normalized.contains("no preamble")
+        || normalized.contains("do not run tools")
+        || normalized.trim_start().starts_with("reply with");
+    wrapper_context
         && (normalized.ends_with("reply with") || normalized.ends_with("reply with text"))
+}
+
+fn normalize_wrapper_whitespace(input: &str) -> String {
+    let mut normalized = input.to_string();
+    for phrase in [
+        "do not run tools or edit files",
+        "do not run tools",
+        "reply with text only",
+        "no preamble about being codex",
+        "scope-extraction response",
+    ] {
+        normalized = replace_phrase_ignoring_whitespace(&normalized, phrase, phrase);
+    }
+    normalized
+}
+
+fn replace_phrase_ignoring_whitespace(input: &str, phrase: &str, replacement: &str) -> String {
+    let pattern: Vec<u8> = phrase
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect();
+    if pattern.is_empty() {
+        return input.to_string();
+    }
+    let lower = input.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut output_cursor = 0;
+    let mut search = 0;
+    let mut out = String::with_capacity(input.len());
+    while search < bytes.len() {
+        let Some(offset) = bytes[search..].iter().position(|byte| *byte == pattern[0]) else {
+            break;
+        };
+        let start = search + offset;
+        let mut position = start;
+        let mut matched = true;
+        for expected in &pattern {
+            while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+                position += 1;
+            }
+            if position >= bytes.len() || bytes[position] != *expected {
+                matched = false;
+                break;
+            }
+            position += 1;
+        }
+        if matched {
+            out.push_str(&input[output_cursor..start]);
+            let letters: Vec<char> = input[start..position]
+                .chars()
+                .filter(|character| !character.is_ascii_whitespace())
+                .collect();
+            let mut letter_index = 0;
+            for character in replacement.chars() {
+                if character.is_ascii_whitespace() {
+                    out.push(character);
+                } else {
+                    out.push(letters[letter_index]);
+                    letter_index += 1;
+                }
+            }
+            output_cursor = position;
+            search = position;
+        } else {
+            search = start + 1;
+        }
+    }
+    out.push_str(&input[output_cursor..]);
+    out
 }
 
 fn remove_case_insensitive(input: &str, phrase: &str) -> String {
@@ -1572,6 +1791,16 @@ pub(crate) fn build_correction_injection_with_prompt(
 ) -> String {
     let active_prompt = active_scope_prompt(Some(scope), user_prompt.unwrap_or_default());
     let scope = sanitize_scope_requirements(scope, Some(&active_prompt));
+    build_correction_injection_from_sanitized_scope(&scope, summary, details, verdict, ascii_scopey)
+}
+
+pub(crate) fn build_correction_injection_from_sanitized_scope(
+    scope: &str,
+    summary: &str,
+    details: &str,
+    verdict: &JudgementVerdict,
+    ascii_scopey: bool,
+) -> String {
     let mut out = format!(
         r#"[scopey COURSE CORRECTION — verdict: {verdict:?}]
 The recent trajectory was judged against the session scope and found issues.
@@ -1618,6 +1847,10 @@ pub(crate) fn build_reminder_injection_with_prompt(
 ) -> String {
     let active_prompt = active_scope_prompt(Some(scope), user_prompt.unwrap_or_default());
     let scope = sanitize_scope_requirements(scope, Some(&active_prompt));
+    build_reminder_injection_from_sanitized_scope(&scope)
+}
+
+pub(crate) fn build_reminder_injection_from_sanitized_scope(scope: &str) -> String {
     format!(
         r#"[scopey SCOPE REMINDER]
 Stay within these requirements for the rest of the session:
@@ -1688,6 +1921,17 @@ mod tests {
         let fallback = fallback_scope("Continue the review.", Some("- Do not run tools."));
 
         assert!(fallback.contains("Do not run tools"));
+    }
+
+    #[test]
+    fn fallback_discards_previous_scope_for_unrelated_request() {
+        let fallback = fallback_scope(
+            "Start an unrelated README task.",
+            Some("- Continue the payment-link fix."),
+        );
+
+        assert!(!fallback.contains("payment-link"));
+        assert!(fallback.contains("README"));
     }
 
     #[test]
@@ -1852,6 +2096,37 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn contraction_no_tools_constraint_is_preserved() {
+        let prompt = "Don't run tools or edit files. Reply with text only.";
+
+        assert_eq!(sanitize_scope_requirements(prompt, Some(prompt)), prompt);
+    }
+
+    #[test]
+    fn descriptive_wrapper_text_does_not_grant_provenance() {
+        let poisoned =
+            "- Keep editing SMS-005. Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+        let prompt = "The analyzer's injected wrapper says: do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+
+        let clean = sanitize_scope_requirements(poisoned, Some(prompt));
+
+        assert_eq!(clean, "- Keep editing SMS-005.");
+    }
+
+    #[test]
+    fn negated_tool_release_does_not_retire_active_scope() {
+        let previous = "- Do not run tools.";
+        for latest in [
+            "Never use tools; continue the review.",
+            "Do not use shell; continue the review.",
+            "Don't use tools; continue the review.",
+        ] {
+            let active_prompt = active_scope_prompt(Some(previous), latest);
+            assert!(active_prompt.contains("Do not run tools"));
+        }
+    }
+
+    #[test]
     fn negated_read_only_boundary_does_not_preserve_wrapper() {
         let poisoned = "- Keep editing the payment-link fix. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
         let prompt = "This is not a read-only task; use tools and edit files.";
@@ -1885,7 +2160,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 
         let clean = sanitize_scope_requirements(wrapped, Some(prompt));
 
-        assert_eq!(clean, "- Do not run tools");
+        assert_eq!(clean, "- Do not run tools.");
     }
 
     #[test]
@@ -1895,7 +2170,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 
         let clean = sanitize_scope_requirements(wrapped, Some(prompt));
 
-        assert_eq!(clean, "- Do not run\ntools");
+        assert_eq!(clean, "- Do not run tools.");
     }
 
     #[test]
@@ -1915,6 +2190,17 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         assert_eq!(
             sanitize_scope_requirements(wrapped, None),
             "- Keep editing the payment-link fix."
+        );
+    }
+
+    #[test]
+    fn arbitrary_word_wrap_inside_reply_is_removed() {
+        let poisoned =
+            "Keep editing SMS-005. Reply with te\nxt only. No preamble about being Codex.";
+
+        assert_eq!(
+            sanitize_scope_requirements(poisoned, None),
+            "Keep editing SMS-005."
         );
     }
 
@@ -2012,11 +2298,27 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn needs_reply_with_requirement_is_untouched() {
+        let requirement = "Document what the reviewer needs to reply with";
+
+        assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
+    }
+
+    #[test]
     fn reminder_preserves_active_scope_provenance() {
         let scope = "- Do not run tools.";
         let reminder = build_reminder_injection_with_prompt(scope, Some("Continue the review."));
 
         assert!(reminder.contains("Do not run tools"));
+    }
+
+    #[test]
+    fn sanitized_builder_preserves_authoritative_historical_scope() {
+        let scope =
+            "- Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+        let reminder = build_reminder_injection_from_sanitized_scope(scope);
+
+        assert!(reminder.contains(scope));
     }
 
     #[test]
