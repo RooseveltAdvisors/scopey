@@ -276,7 +276,7 @@ herdr_report_state = false
         .rev()
         .find(|message| message["type"] == "scope_requirements")
         .unwrap()["content"] = serde_json::json!(
-        "- Preserve payment-link semantics. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex. Keep editing SMS-005.\n- Do not use shell.\n- Scope-extraction response: return current requirements only."
+        "- Preserve payment-link semantics. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex. Keep editing SMS-005.\n- Do not use shell.\n- No tools.\n- No edits.\n- No preamble.\n- Scope-extraction response: return current requirements only."
     );
     store["messages"]
         .as_array_mut()
@@ -395,6 +395,9 @@ fn assert_clean_injection(stdout: &[u8]) {
         "CRITICAL:",
         "edit files",
         "Do not use shell",
+        "No tools",
+        "No edits",
+        "No preamble.",
         "Reply with text only",
         "No preamble about being Codex",
         "Scope-extraction response",
