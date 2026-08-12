@@ -238,7 +238,7 @@ herdr_report_state = false
     .unwrap();
 
     let prompt = format!(
-        r#"{{"session_id":"{sid}","cwd":"{}","prompt":"Keep editing the payment-link fix.","hook_event_name":"UserPromptSubmit"}}"#,
+        r#"{{"session_id":"{sid}","cwd":"{}","prompt":"Keep editing the payment-link fix. For this read-only audit, do not run tools.","hook_event_name":"UserPromptSubmit"}}"#,
         cwd.display()
     );
     let prompt_out = run_hook_with_config(home.path(), Some(&config), "user-prompt", &prompt);
@@ -328,8 +328,9 @@ herdr_report_state = false
 
 fn assert_injection_is_sanitized(context: &str) {
     assert!(context.contains("Keep editing the payment-link fix"));
+    assert!(context.contains("Do not run tools"));
     for phrase in [
-        "Do not run tools",
+        "CRITICAL:",
         "edit files",
         "Reply with text only",
         "No preamble about being Codex",
