@@ -133,36 +133,15 @@ fn fallback_scope(latest_prompt: &str) -> String {
 }
 
 fn active_user_prompt_context(user_prompts: &[String], latest_prompt: &str) -> String {
-    if user_prompts.is_empty() {
-        return latest_prompt.to_string();
+    let mut prompts = user_prompts.to_vec();
+    if !latest_prompt.trim().is_empty()
+        && !prompts
+            .iter()
+            .any(|prompt| prompt.trim() == latest_prompt.trim())
+    {
+        prompts.push(latest_prompt.to_string());
     }
-    let releases_no_tools = latest_prompt_releases_no_tools(latest_prompt);
-    let releases_file_edits = latest_prompt_releases_file_edits(latest_prompt);
-    let latest_index = user_prompts
-        .iter()
-        .rposition(|prompt| prompt.trim() == latest_prompt.trim());
-    let active_from = user_prompts
-        .iter()
-        .rposition(|prompt| latest_prompt_replaces_scope(prompt))
-        .unwrap_or(0);
-    let mut active = user_prompts
-        .iter()
-        .enumerate()
-        .skip(active_from)
-        .filter_map(|(index, prompt)| {
-            let prompt =
-                if (releases_no_tools || releases_file_edits) && Some(index) != latest_index {
-                    retire_constraints(prompt, releases_no_tools, releases_file_edits)
-                } else {
-                    prompt.to_string()
-                };
-            (!prompt.trim().is_empty()).then_some(prompt)
-        })
-        .collect::<Vec<_>>();
-    if !latest_prompt.trim().is_empty() && latest_index.is_none() {
-        active.push(latest_prompt.to_string());
-    }
-    active.join("\n\n")
+    prompts.join("\n\n")
 }
 
 fn retire_constraints(input: &str, release_no_tools: bool, release_file_edits: bool) -> String {
@@ -205,61 +184,6 @@ fn retire_constraints(input: &str, release_no_tools: bool, release_file_edits: b
         .to_string()
 }
 
-fn latest_prompt_replaces_scope(prompt: &str) -> bool {
-    normalize_wrapper_whitespace(prompt)
-        .split(|ch: char| matches!(ch, '.' | '!' | '?' | ';' | '\n'))
-        .any(explicit_scope_replacement_clause)
-}
-
-fn explicit_scope_replacement_clause(clause: &str) -> bool {
-    let mut clause = clause
-        .trim()
-        .trim_start_matches(['-', '*', '>', '`', '\'', '"'])
-        .trim()
-        .to_ascii_lowercase();
-    loop {
-        let mut stripped = false;
-        for prefix in [
-            "please ",
-            "now ",
-            "then ",
-            "let's ",
-            "lets ",
-            "can you ",
-            "could you ",
-            "i want you to ",
-            "i want to ",
-            "we need to ",
-        ] {
-            if let Some(rest) = clause.strip_prefix(prefix) {
-                clause = rest.trim_start().to_string();
-                stripped = true;
-                break;
-            }
-        }
-        if !stripped {
-            break;
-        }
-    }
-    [
-        "start an unrelated ",
-        "begin an unrelated ",
-        "start a new task",
-        "begin a new task",
-        "create a new task",
-        "start a different task",
-        "begin a different task",
-        "work on a different task",
-        "switch to",
-        "instead,",
-        "instead of",
-        "replace the previous",
-        "forget the previous",
-    ]
-    .iter()
-    .any(|marker| clause.starts_with(marker))
-}
-
 fn extract_scope_transition(output: &str) -> (String, String) {
     let trimmed = output.trim();
     let Some((first, rest)) = trimmed.split_once('\n') else {
@@ -299,160 +223,99 @@ fn sanitize_scope_requirements(content: &str, user_prompt: Option<&str>) -> Stri
     clean_lines.join("\n").trim().to_string()
 }
 
-fn active_scope_prompt(previous_scope: Option<&str>, latest_prompt: &str) -> String {
-    let releases_no_tools = latest_prompt_releases_no_tools(latest_prompt);
-    let releases_file_edits = latest_prompt_releases_file_edits(latest_prompt);
-    let Some(previous_scope) = previous_scope
-        .filter(|scope| !scope.trim().is_empty())
-        .and_then(safe_active_scope_context)
-        .map(|scope| retire_constraints(&scope, releases_no_tools, releases_file_edits))
-        .filter(|scope| !scope.trim().is_empty())
-    else {
-        return latest_prompt.to_string();
-    };
-    format!("{previous_scope}\n{latest_prompt}")
-}
-
-fn safe_active_scope_context(scope: &str) -> Option<String> {
-    let safe = scope
-        .lines()
-        .filter(|line| {
-            let normalized = line.to_ascii_lowercase();
-            (explicit_no_tools_constraint(&normalized) || normalized.contains("read-only"))
-                && !normalized.contains("critical:")
-                && !normalized.contains("scope-extraction")
-                && !normalized.contains("reply with text only")
-                && !normalized.contains("no preamble")
-                && !normalized.contains("being codex")
-                && !normalized.contains("do not run tools or edit files")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!safe.is_empty()).then_some(safe)
+fn transition_replaces_scope(transition: &str) -> bool {
+    transition == "FALLBACK_LATEST"
+        || transition
+            .split(',')
+            .any(|operation| operation.trim() == "REPLACE")
 }
 
 pub(crate) fn sanitized_scope_requirements_for_injection(
     store: &SessionStore,
     latest_user_prompt: Option<&str>,
 ) -> Option<String> {
-    let user_prompts = store.all_user_prompts();
-    let latest = latest_user_prompt
-        .or_else(|| user_prompts.last().map(String::as_str))
-        .unwrap_or_default();
-    let active_prompt = active_user_prompt_context(&user_prompts, latest);
-    let latest_scope_at = store
+    let mut user_prompts = store.all_user_prompts();
+    if let Some(latest) = latest_user_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        if !user_prompts
+            .iter()
+            .any(|prompt| prompt.trim() == latest.trim())
+        {
+            user_prompts.push(latest.to_string());
+        }
+    }
+
+    let latest_scope = store
         .data
         .messages
         .iter()
-        .rposition(|message| message.type_ == crate::session::MessageType::ScopeRequirements);
-    let latest_user_at = store
-        .data
-        .messages
-        .iter()
-        .rposition(|message| message.type_ == crate::session::MessageType::UserPrompt);
-    let replacement_at = store.data.messages.iter().rposition(|message| {
-        message.type_ == crate::session::MessageType::UserPrompt
-            && message
-                .content
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.type_ == crate::session::MessageType::ScopeRequirements);
+    if latest_scope.is_none() {
+        let latest = user_prompts.last()?;
+        let clean = sanitize_scope_requirements(latest, Some(latest));
+        return (!clean.trim().is_empty()).then_some(clean);
+    }
+    let covered_prompt_count =
+        |scope_index: usize, message: &crate::session::SessionMessageWire| {
+            message
+                .prompt_hash
                 .as_deref()
-                .is_some_and(latest_prompt_replaces_scope)
-    });
-    if latest_prompt_replaces_scope(latest)
-        || replacement_at
-            .is_some_and(|replacement| latest_scope_at.map_or(true, |scope| replacement > scope))
-    {
-        let clean_active = sanitize_scope_requirements(&active_prompt, Some(&active_prompt));
-        return (!clean_active.trim().is_empty()).then_some(clean_active);
+                .and_then(|scope_hash| {
+                    (1..=user_prompts.len()).find(|count| {
+                        hash_prompt(&user_prompts[..*count].join("\n\n---\n\n")) == scope_hash
+                    })
+                })
+                .unwrap_or_else(|| {
+                    store.data.messages[..scope_index]
+                        .iter()
+                        .filter(|message| message.type_ == crate::session::MessageType::UserPrompt)
+                        .count()
+                })
+                .min(user_prompts.len())
+        };
+    let covered_prompts = latest_scope
+        .map(|(scope_index, message)| covered_prompt_count(scope_index, message))
+        .unwrap_or(0);
+
+    if covered_prompts < user_prompts.len() {
+        let pending = user_prompts[covered_prompts..].join("\n\n");
+        let clean = sanitize_scope_requirements(&pending, Some(&pending));
+        return (!clean.trim().is_empty()).then_some(clean);
     }
-    if let Some(scope) = store.latest_scope_requirements() {
-        let mut clean = sanitize_scope_requirements(&scope, Some(&active_prompt));
-        let scope_is_stale = latest_user_at
-            .zip(latest_scope_at)
-            .is_some_and(|(user, scope)| user > scope);
-        if scope_is_stale && latest_prompt_adds_scope(latest) {
-            let clean_latest = sanitize_scope_requirements(latest, Some(&active_prompt));
-            if !clean_latest.trim().is_empty() && !clean.contains(clean_latest.trim()) {
-                clean = if clean.trim().is_empty() {
-                    clean_latest
-                } else {
-                    format!("{clean}\n{clean_latest}")
-                };
+
+    let provenance_start = latest_scope
+        .and_then(|(latest_scope_index, _)| {
+            store.data.messages[..=latest_scope_index]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, message)| {
+                    message.type_ == crate::session::MessageType::ScopeRequirements
+                        && message
+                            .kind
+                            .as_deref()
+                            .is_some_and(transition_replaces_scope)
+                })
+                .map(|(scope_index, message)| {
+                    covered_prompt_count(scope_index, message).saturating_sub(1)
+                })
+        })
+        .unwrap_or(0)
+        .min(covered_prompts);
+    let provenance = user_prompts[provenance_start..covered_prompts].join("\n\n");
+    if let Some((_, message)) = latest_scope {
+        if let Some(scope) = message.content.as_deref() {
+            let clean = sanitize_scope_requirements(scope, Some(&provenance));
+            if !clean.trim().is_empty() {
+                return Some(clean);
             }
         }
-        if !clean.trim().is_empty() {
-            return Some(clean);
-        }
     }
-    let clean_active = sanitize_scope_requirements(&active_prompt, Some(&active_prompt));
-    if !clean_active.trim().is_empty() {
-        return Some(clean_active);
-    }
-    let clean_latest = sanitize_scope_requirements(latest, Some(&active_prompt));
-    (!clean_latest.trim().is_empty()).then_some(clean_latest)
-}
 
-fn latest_prompt_adds_scope(prompt: &str) -> bool {
-    let prompt = prompt
-        .trim()
-        .trim_start_matches(['-', '*', '>', '`'])
-        .trim()
-        .to_ascii_lowercase();
-    ["also ", "additionally ", "in addition, "]
-        .iter()
-        .any(|prefix| prompt.starts_with(prefix))
-}
-
-fn latest_prompt_releases_no_tools(prompt: &str) -> bool {
-    normalize_wrapper_whitespace(prompt)
-        .split(|ch: char| matches!(ch, '.' | '!' | '?' | '\n'))
-        .any(|segment| {
-            let normalized = segment.to_ascii_lowercase();
-            if normalized.contains("critical:") || normalized.contains("scope-extraction response")
-            {
-                return false;
-            }
-            if descriptive_wrapper_text(&normalized) {
-                return false;
-            }
-            if explicit_constraint_cancellation(&normalized, TOOL_CONSTRAINT_SUBJECTS) {
-                return true;
-            }
-            if explicit_tool_use_constraint(&normalized) {
-                return false;
-            }
-            positive_tool_authorization(&normalized)
-        })
-}
-
-fn latest_prompt_releases_file_edits(prompt: &str) -> bool {
-    normalize_wrapper_whitespace(prompt)
-        .split(|ch: char| matches!(ch, '.' | '!' | '?' | '\n'))
-        .any(|segment| {
-            let normalized = segment.to_ascii_lowercase();
-            if descriptive_wrapper_text(&normalized) {
-                return false;
-            }
-            if explicit_constraint_cancellation(&normalized, EDIT_CONSTRAINT_SUBJECTS) {
-                return true;
-            }
-            !explicit_no_edit_constraint(&normalized)
-                && !read_only_constraint_requested(&normalized)
-                && positive_authorization(
-                    &normalized,
-                    &[
-                        "file edits are allowed",
-                        "you may edit files",
-                        "please edit files",
-                        "continue with shell and file edits",
-                        "continue with tools and file edits",
-                        "continue with file edits",
-                        "continue editing files",
-                        "use tools and edit files",
-                        "use shell and edit files",
-                        "edit files",
-                    ],
-                )
-        })
+    let latest = user_prompts.last()?;
+    let clean = sanitize_scope_requirements(latest, Some(latest));
+    (!clean.trim().is_empty()).then_some(clean)
 }
 
 const TOOL_CONSTRAINT_SUBJECTS: &[&str] = &[
@@ -502,87 +365,40 @@ fn explicit_constraint_cancellation(segment: &str, subjects: &[&str]) -> bool {
                 .any(|signal| normalized.starts_with(signal)))
 }
 
-fn positive_tool_authorization(segment: &str) -> bool {
-    positive_authorization(
-        segment,
-        &[
-            "tools are allowed",
-            "tools may be used",
-            "you may use tools",
-            "please use tools",
-            "use tools",
-            "you may use shell",
-            "please use shell",
-            "use shell",
-            "browser is allowed",
-            "browser may be used",
-            "you may use browser",
-            "please use browser",
-            "use browser",
-            "you may use the browser",
-            "please use the browser",
-            "use the browser",
-            "continue with browser",
-            "continue with shell",
-            "continue with file edits",
-            "continue editing files",
-            "edit files",
-        ],
-    )
-}
+fn strip_unsupported_wrapper_fragments(
+    input: &str,
+    preserve_no_tools: bool,
+    preserve_no_edits: bool,
+    preserve_reply: bool,
+    preserve_preamble: bool,
+) -> String {
+    let normalized = input.to_ascii_lowercase();
+    let has_wrapper_control = explicit_no_tools_constraint(&normalized)
+        || normalized.contains("reply with text only")
+        || normalized.contains("no preamble about being codex");
+    let mut clean = input.to_string();
 
-fn positive_authorization(segment: &str, prefixes: &[&str]) -> bool {
-    let normalized = segment
-        .trim()
-        .trim_matches(|ch: char| ch.is_whitespace() || ".,;:".contains(ch))
-        .to_ascii_lowercase();
-    prefixes.iter().any(|prefix| {
-        let Some(remainder) = normalized.strip_prefix(prefix) else {
-            return false;
-        };
-        if remainder
-            .chars()
-            .next()
-            .is_some_and(|ch| !ch.is_whitespace() && !"—–-,:;".contains(ch))
-        {
-            return false;
+    match (preserve_no_tools, preserve_no_edits) {
+        (false, false) => clean = remove_no_tools_constraints(&clean),
+        (false, true) => clean = retire_constraints(&clean, true, false),
+        (true, false) => {
+            clean = normalize_no_tools_wrapper(&clean);
+            for phrase in EXPLICIT_NO_EDIT_CONSTRAINT_PHRASES {
+                clean = remove_case_insensitive(&clean, phrase);
+            }
         }
-        let remainder =
-            remainder.trim_start_matches(|ch: char| ch.is_whitespace() || "—–-,:;".contains(ch));
-        [
-            "not ",
-            "never ",
-            "without ",
-            "except ",
-            "unless ",
-            "but not ",
-            "but keep",
-            "but remain",
-            "while keeping",
-            "while remaining",
-            "not for this task",
-            "read-only",
-            "read only",
-            "no tools",
-            "do not use tools",
-            "don't use tools",
-            "cannot use tools",
-            "can't use tools",
-            "do not run tools",
-            "don't run tools",
-            "cannot run tools",
-            "can't run tools",
-        ]
-        .iter()
-        .all(|negative| !remainder.starts_with(negative))
-            && !remainder.contains(" but keep")
-            && !remainder.contains(" but remain")
-            && !remainder.contains(" while keeping")
-            && !remainder.contains(" while remaining")
-            && !remainder.contains(" read-only")
-            && !remainder.contains(" read only")
-            && !remainder.contains(" no tools")
-    })
+        (true, true) => {}
+    }
+    if !preserve_reply {
+        clean = remove_case_insensitive(&clean, "reply with text only");
+    }
+    if !preserve_preamble {
+        clean = remove_case_insensitive(&clean, "no preamble about being codex");
+    }
+    if has_wrapper_control {
+        clean = remove_case_insensitive(&clean, "critical:");
+    }
+    collapse_removed_wrapper_punctuation(&clean)
 }
 
 fn sanitize_scope_line(
@@ -610,33 +426,44 @@ fn sanitize_scope_line(
         return Some(line.to_string());
     }
 
+    let mut clean = strip_unsupported_wrapper_fragments(
+        line,
+        preserve_no_tools,
+        preserve_no_edits,
+        preserve_reply,
+        preserve_preamble,
+    );
+    let normalized = clean.to_ascii_lowercase();
     let fragment = normalized
         .trim()
         .trim_start_matches(['-', '*', '`'])
         .trim()
         .trim_matches(|ch: char| ch.is_whitespace() || ".,:;!?`".contains(ch));
+    if fragment.is_empty() {
+        return None;
+    }
     let standalone_tool_constraint = EXPLICIT_TOOL_USE_CONSTRAINT_PHRASES.iter().any(|phrase| {
         fragment == *phrase || fragment.strip_prefix(phrase) == Some(" or edit files")
     });
     if standalone_tool_constraint {
         if preserve_no_tools && preserve_no_edits {
-            return Some(line.to_string());
+            return Some(clean);
         }
         if preserve_no_tools {
-            return Some(normalize_no_tools_wrapper(line));
+            return Some(normalize_no_tools_wrapper(&clean));
         }
         if preserve_no_edits && fragment.ends_with("edit files") {
-            return Some(retire_constraints(line, true, false));
+            return Some(retire_constraints(&clean, true, false));
         }
         return None;
     }
     if EXPLICIT_NO_EDIT_CONSTRAINT_PHRASES.contains(&fragment) {
-        return preserve_no_edits.then(|| line.to_string());
+        return preserve_no_edits.then_some(clean);
     }
     if fragment == "reply with text only" && preserve_reply
         || matches!(fragment, "no preamble" | "no preamble about being codex") && preserve_preamble
     {
-        return Some(line.to_string());
+        return Some(clean);
     }
     if matches!(
         fragment,
@@ -649,14 +476,12 @@ fn sanitize_scope_line(
         return None;
     }
 
-    let mut clean = if let Some(marker) = wrapped_continuation {
-        let mut clean = remove_continuation_marker(line, marker, preserve_no_tools);
+    if let Some(marker) = wrapped_continuation {
+        clean = remove_continuation_marker(&clean, marker, preserve_no_tools);
         clean = remove_case_insensitive(&clean, "reply with text only");
         clean = remove_case_insensitive(&clean, "no preamble about being codex");
-        remove_case_insensitive(&clean, "no preamble")
-    } else {
-        line.to_string()
-    };
+        clean = remove_case_insensitive(&clean, "no preamble");
+    }
     let normalized = clean.to_ascii_lowercase();
     let starts_with_critical = normalized
         .trim_start()
@@ -870,15 +695,16 @@ fn user_prompt_supports(user_prompt: Option<&str>, kind: &str) -> bool {
         return false;
     };
     let prompt = normalize_wrapper_whitespace(prompt);
-    let supports_no_tools = prompt
-        .split(|ch: char| matches!(ch, '.' | '!' | '?' | ',' | ';' | '\n'))
-        .any(|segment| user_constraint_segment_supports(segment, "no_tools"));
-    if matches!(kind, "reply" | "preamble") && !supports_no_tools {
+    let segments = || prompt.split(|ch: char| matches!(ch, '.' | '!' | '?' | ',' | ';' | '\n'));
+    let supports_no_tools =
+        segments().any(|segment| user_constraint_segment_supports(segment, "no_tools"));
+    if matches!(kind, "reply" | "preamble")
+        && explicit_tool_use_constraint(&prompt.to_ascii_lowercase())
+        && !supports_no_tools
+    {
         return false;
     }
-    prompt
-        .split(|ch: char| matches!(ch, '.' | '!' | '?' | ',' | ';' | '\n'))
-        .any(|segment| user_constraint_segment_supports(segment, kind))
+    segments().any(|segment| user_constraint_segment_supports(segment, kind))
 }
 
 fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
@@ -943,10 +769,22 @@ fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
         "no_edits" => {
             explicit_no_edit_constraint(normalized) || imperative_read_only_constraint(normalized)
         }
-        "reply" => normalized.contains("reply with text only"),
-        "preamble" => normalized.contains("no preamble about being codex"),
+        "reply" => direct_output_constraint(normalized, "reply with text only"),
+        "preamble" => direct_output_constraint(normalized, "no preamble about being codex"),
         _ => false,
     }
+}
+
+fn direct_output_constraint(text: &str, phrase: &str) -> bool {
+    let text = text.trim().trim_start_matches(['-', '*', '>', '`']).trim();
+    text.starts_with(phrase)
+        || ["please ", "you must ", "you should ", "the agent must "]
+            .iter()
+            .any(|prefix| {
+                text.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(phrase))
+            })
+        || text.contains(&format!(" and {phrase}"))
 }
 
 fn imperative_read_only_constraint(text: &str) -> bool {
@@ -1006,8 +844,6 @@ fn descriptive_constraint_prefix(text: &str) -> bool {
     let direct = [
         "please",
         "you",
-        "i",
-        "we",
         "i require",
         "i require you to",
         "i require that you",
@@ -1481,7 +1317,7 @@ pub fn summarize_scope(
         "starting summarize",
         json!({ "cwd": cwd.display().to_string() }),
     );
-    let (prompts, previous_scope, harness) = {
+    let (prompts, previous_scope, harness, provenance_start) = {
         let mut store = SessionStore::open_or_create(cfg, cwd, session_id, "")?;
         if let Some(p) = extra_prompt {
             if !p.trim().is_empty() {
@@ -1492,10 +1328,44 @@ pub fn summarize_scope(
         }
         let prompts = store.all_user_prompts();
         let previous_scope = store.latest_scope_requirements();
+        let provenance_start = store
+            .data
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| {
+                message.type_ == crate::session::MessageType::ScopeRequirements
+                    && message
+                        .kind
+                        .as_deref()
+                        .is_some_and(transition_replaces_scope)
+            })
+            .map(|(scope_index, message)| {
+                message
+                    .prompt_hash
+                    .as_deref()
+                    .and_then(|scope_hash| {
+                        (1..=prompts.len()).find(|count| {
+                            hash_prompt(&prompts[..*count].join("\n\n---\n\n")) == scope_hash
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        store.data.messages[..scope_index]
+                            .iter()
+                            .filter(|message| {
+                                message.type_ == crate::session::MessageType::UserPrompt
+                            })
+                            .count()
+                    })
+                    .saturating_sub(1)
+                    .min(prompts.len())
+            })
+            .unwrap_or(0);
         let harness = store.data.harness.clone();
         // Drop store before model.complete — exclusive flock must not span network I/O.
         drop(store);
-        (prompts, previous_scope, harness)
+        (prompts, previous_scope, harness, provenance_start)
     };
     if prompts.is_empty() {
         eventlog::warn(
@@ -1534,7 +1404,11 @@ pub fn summarize_scope(
             ("FALLBACK_LATEST".into(), fallback_scope(latest_prompt))
         }
     };
-    let active_prompt = active_user_prompt_context(&prompts, latest_prompt);
+    let active_prompt = if transition_replaces_scope(&transition) {
+        latest_prompt.to_string()
+    } else {
+        active_user_prompt_context(&prompts[provenance_start..], latest_prompt)
+    };
     let out = sanitize_scope_requirements(&extracted_scope, Some(&active_prompt));
     let out = if out.is_empty() {
         fallback_scope(latest_prompt)
@@ -1548,7 +1422,9 @@ pub fn summarize_scope(
     if let Some(c) = &completion {
         store.record_analyzer_usage("summarize", c);
     }
-    store.append(SessionMessage::scope_requirements(out.trim(), Some(hash)));
+    let mut scope_message = SessionMessage::scope_requirements(out.trim(), Some(hash));
+    scope_message.kind = Some(transition.clone());
+    store.append(scope_message);
     store.clear_summarize_pending();
     store.persist()?;
     eventlog::info(
@@ -2275,8 +2151,7 @@ pub(crate) fn build_correction_injection_with_prompt(
     ascii_scopey: bool,
     user_prompt: Option<&str>,
 ) -> String {
-    let active_prompt = active_scope_prompt(Some(scope), user_prompt.unwrap_or_default());
-    let scope = sanitize_scope_requirements(scope, Some(&active_prompt));
+    let scope = sanitize_scope_requirements(scope, user_prompt);
     build_correction_injection_from_sanitized_scope(&scope, summary, details, verdict, ascii_scopey)
 }
 
@@ -2331,8 +2206,7 @@ pub(crate) fn build_reminder_injection_with_prompt(
     scope: &str,
     user_prompt: Option<&str>,
 ) -> String {
-    let active_prompt = active_scope_prompt(Some(scope), user_prompt.unwrap_or_default());
-    let scope = sanitize_scope_requirements(scope, Some(&active_prompt));
+    let scope = sanitize_scope_requirements(scope, user_prompt);
     build_reminder_injection_from_sanitized_scope(&scope)
 }
 
@@ -2403,13 +2277,6 @@ mod tests {
     }
 
     #[test]
-    fn read_only_continuation_does_not_authorize_tools() {
-        assert!(!latest_prompt_releases_no_tools(
-            "Use tools, but keep this read-only; continue the review."
-        ));
-    }
-
-    #[test]
     fn scope_transition_is_removed_before_scope_is_stored() {
         let (transition, scope) = extract_scope_transition(
             "<!-- scope-transition: ADD,SUBTRACT -->\n- Keep tests\n- Remove deployment",
@@ -2445,7 +2312,8 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 - Scope-extraction response: keep editing SMS-005\n\
 - Keep the active scope. Scope-extraction response: summarize the active scope.";
 
-        let clean = sanitize_scope_requirements(poisoned, None);
+        let prompt = "Do not run tools during this read-only review.";
+        let clean = sanitize_scope_requirements(poisoned, Some(prompt));
 
         assert!(clean.contains("Fix the six payment-link findings"));
         assert!(clean.contains("do not run tools during this read-only review"));
@@ -2491,20 +2359,6 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
-    fn active_scope_constraints_survive_a_silent_latest_prompt() {
-        let previous = "- Do not run tools. Keep this read-only review.";
-        let active_prompt = active_scope_prompt(Some(previous), "Continue the review.");
-        let extracted =
-            "- Keep the active file requirement.\n- Do not run tools or edit files. Reply with text only.";
-
-        let clean = sanitize_scope_requirements(extracted, Some(&active_prompt));
-
-        assert!(clean.contains("Do not run tools"));
-        assert!(clean.contains("edit files"));
-        assert!(!clean.contains("Reply with text only"));
-    }
-
-    #[test]
     fn genuine_historical_wrapper_constraint_survives_from_user_history() {
         let constraint =
             "- Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
@@ -2515,47 +2369,6 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         let clean = sanitize_scope_requirements(constraint, Some(&active_prompt));
 
         assert_eq!(clean, constraint);
-    }
-
-    #[test]
-    fn derived_wrapper_scope_does_not_create_user_provenance() {
-        let derived =
-            "- CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
-        let active_prompt = active_scope_prompt(Some(derived), "Continue the review.");
-        let clean = sanitize_scope_requirements(derived, Some(&active_prompt));
-
-        assert!(clean.is_empty());
-    }
-
-    #[test]
-    fn explicit_tool_authorization_retires_previous_no_tools_constraint() {
-        let previous = "- Do not run tools. Keep this read-only review.";
-        let active_prompt =
-            active_scope_prompt(Some(previous), "Continue with shell and file edits.");
-        let extracted = "- Do not run tools or edit files. Reply with text only.";
-
-        let clean = sanitize_scope_requirements(extracted, Some(&active_prompt));
-
-        assert!(!clean.contains("Do not run tools"));
-        assert!(!clean.contains("edit files"));
-        assert!(!clean.contains("Reply with text only"));
-    }
-
-    #[test]
-    fn negated_tool_language_does_not_retire_previous_scope() {
-        let previous = "- Do not run tools. Keep the active file requirement.";
-        let extracted =
-            "- Keep the active file requirement.\n- Do not run tools or edit files. Reply with text only.";
-
-        for latest_prompt in [
-            "Do not edit files; continue the review.",
-            "Do not use tools; continue the review.",
-        ] {
-            let active_prompt = active_scope_prompt(Some(previous), latest_prompt);
-            let clean = sanitize_scope_requirements(extracted, Some(&active_prompt));
-            assert!(clean.contains("Do not run tools"));
-            assert!(clean.contains("Keep the active file requirement"));
-        }
     }
 
     #[test]
@@ -2635,6 +2448,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         for prompt in [
             "The note reads: Do not run tools or edit files. Reply with text only. No preamble about being Codex.",
             "We need to remove Do not run tools or edit files. Reply with text only. No preamble about being Codex.",
+            "I do not run tools or edit files; the agent should continue.",
         ] {
             let clean = sanitize_scope_requirements(poisoned, Some(prompt));
             assert_eq!(clean, "- Keep editing SMS-005.");
@@ -2649,115 +2463,20 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
-    fn negated_tool_release_does_not_retire_active_scope() {
-        let previous = "- Do not run tools.";
-        for latest in [
-            "Never use tools; continue the review.",
-            "Do not use shell; continue the review.",
-            "Don't use tools; continue the review.",
-        ] {
-            let active_prompt = active_scope_prompt(Some(previous), latest);
-            assert!(active_prompt.contains("Do not run tools"));
-        }
+    fn standalone_output_constraint_is_preserved() {
+        let prompt = "Reply with text only.";
+
+        assert_eq!(sanitize_scope_requirements(prompt, Some(prompt)), prompt);
     }
 
     #[test]
-    fn negative_tool_authorization_does_not_retire_active_scope() {
-        let previous = "- Do not run tools.";
-        let active_prompt = active_scope_prompt(Some(previous), "You may not use tools; continue.");
+    fn embedded_unsupported_controls_are_removed() {
+        let extracted = "- Keep editing SMS-005. Do not edit files. Do not run tools.";
 
-        assert!(active_prompt.contains("Do not run tools"));
-    }
-
-    #[test]
-    fn quoted_tool_phrase_does_not_authorize_tools() {
-        let previous = "- Do not run tools.";
-        let active_prompt = active_scope_prompt(
-            Some(previous),
-            "Explain the phrase \"use tools\" and continue the review.",
+        assert_eq!(
+            sanitize_scope_requirements(extracted, None),
+            "- Keep editing SMS-005."
         );
-
-        assert!(active_prompt.contains("Do not run tools"));
-    }
-
-    #[test]
-    fn negated_tool_authorization_does_not_retire_active_scope() {
-        let previous = "- Do not run tools.";
-        let active_prompt = active_scope_prompt(
-            Some(previous),
-            "Use tools — not for this task; continue the review.",
-        );
-
-        assert!(active_prompt.contains("Do not run tools"));
-    }
-
-    #[test]
-    fn browser_authorization_retires_previous_no_tools_constraint() {
-        let previous = "- Do not run tools.";
-        let active_prompt =
-            active_scope_prompt(Some(previous), "Use the browser to inspect SMS-005.");
-
-        assert!(!active_prompt.contains("Do not run tools"));
-        assert!(active_prompt.contains("Use the browser"));
-    }
-
-    #[test]
-    fn punctuated_authorization_preserves_unrelated_active_requirements() {
-        for latest in [
-            "Use tools, then inspect SMS-005.",
-            "Use the browser, then inspect SMS-005.",
-        ] {
-            let prompts = vec![
-                "Fix SMS-005. Do not run tools or edit files.".to_string(),
-                latest.to_string(),
-            ];
-            let active = active_user_prompt_context(&prompts, latest);
-
-            assert!(active.contains("Fix SMS-005"));
-            assert!(!active.contains("Do not run tools"));
-            assert!(active.contains("Do not edit files"));
-            assert!(active.contains(latest));
-        }
-    }
-
-    #[test]
-    fn file_edit_authorization_retires_only_authorized_constraints() {
-        let prompts = vec![
-            "Fix SMS-005. Do not run tools or edit files.".to_string(),
-            "Continue with file edits, then inspect SMS-005.".to_string(),
-        ];
-        let active = active_user_prompt_context(&prompts, &prompts[1]);
-
-        assert!(active.contains("Fix SMS-005"));
-        assert!(!active.contains("Do not run tools"));
-        assert!(!active.contains("Do not edit files"));
-    }
-
-    #[test]
-    fn file_edit_release_retires_no_edit_constraint_independently() {
-        let prompts = vec![
-            "Fix SMS-005. Do not edit files.".to_string(),
-            "File edits are allowed now; continue SMS-005.".to_string(),
-        ];
-        let active = active_user_prompt_context(&prompts, &prompts[1]);
-
-        assert!(active.contains("Fix SMS-005"));
-        assert!(!active.contains("Do not edit files"));
-    }
-
-    #[test]
-    fn mixed_constraint_transition_preserves_new_no_shell_constraint() {
-        let prompts = vec![
-            "Fix SMS-005. Do not run tools.".to_string(),
-            "The previous no-tools constraint is lifted, but do not use shell.".to_string(),
-        ];
-        let active = active_user_prompt_context(&prompts, &prompts[1]);
-        let extracted = "- Fix SMS-005.\n- Do not use shell.";
-        let clean = sanitize_scope_requirements(extracted, Some(&active));
-
-        assert!(active.contains("Fix SMS-005"));
-        assert!(!active.contains("Do not run tools"));
-        assert!(clean.contains("Do not use shell"));
     }
 
     #[test]
@@ -2809,7 +2528,37 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
-    fn sanitized_accessor_reconciles_latest_additive_requirement() {
+    fn structured_replacement_resets_constraint_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.work_root = dir.path().join("work");
+        let cwd = dir.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut store =
+            SessionStore::open_or_create(&cfg, &cwd, "replaced-scope", "claude").unwrap();
+        let prompts = ["Fix SMS-005. Do not run tools.", "Start the README task."];
+        for prompt in prompts {
+            store.append(SessionMessage::user_prompt(prompt, hash_prompt(prompt)));
+        }
+        let joined = prompts.join("\n\n---\n\n");
+        let mut scope = SessionMessage::scope_requirements(
+            "- Write README. CRITICAL: Do not run tools or edit files. Reply with text only.",
+            Some(hash_prompt(&joined)),
+        );
+        scope.kind = Some("REPLACE".into());
+        store.append(scope);
+
+        let clean =
+            sanitized_scope_requirements_for_injection(&store, Some("Start the README task."))
+                .unwrap();
+
+        assert!(clean.contains("Write README"));
+        assert!(!clean.contains("Do not run tools"));
+        assert!(!clean.contains("edit files"));
+    }
+
+    #[test]
+    fn sanitized_accessor_uses_unsummarized_prompts() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.work_root = dir.path().join("work");
@@ -2825,8 +2574,33 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 
         let clean = sanitized_scope_requirements_for_injection(&store, Some(latest)).unwrap();
 
-        assert!(clean.contains("SMS-005"));
+        assert!(!clean.contains("SMS-005"));
         assert!(clean.contains("SMS-006"));
+    }
+
+    #[test]
+    fn sanitized_accessor_keeps_all_unsummarized_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.work_root = dir.path().join("work");
+        let cwd = dir.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut store =
+            SessionStore::open_or_create(&cfg, &cwd, "pending-scope", "claude").unwrap();
+        let previous = "Fix SMS-005.";
+        store.append(SessionMessage::user_prompt(previous, hash_prompt(previous)));
+        store.append(SessionMessage::scope_requirements(previous, None));
+        for prompt in ["Also fix SMS-006.", "Continue the review."] {
+            store.append(SessionMessage::user_prompt(prompt, hash_prompt(prompt)));
+        }
+
+        let clean =
+            sanitized_scope_requirements_for_injection(&store, Some("Continue the review."))
+                .unwrap();
+
+        assert!(clean.contains("SMS-006"));
+        assert!(clean.contains("Continue the review"));
+        assert!(!clean.contains("SMS-005"));
     }
 
     #[test]
@@ -3136,14 +2910,6 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         let requirement = "Document what the reviewer needs to reply with";
 
         assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
-    }
-
-    #[test]
-    fn reminder_preserves_active_scope_provenance() {
-        let scope = "- Do not run tools.";
-        let reminder = build_reminder_injection_with_prompt(scope, Some("Continue the review."));
-
-        assert!(reminder.contains("Do not run tools"));
     }
 
     #[test]
