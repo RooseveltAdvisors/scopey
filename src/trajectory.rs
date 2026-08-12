@@ -190,10 +190,31 @@ fn active_scope_prompt(previous_scope: Option<&str>, latest_prompt: &str) -> Str
     if latest_prompt_releases_no_tools(latest_prompt) {
         return latest_prompt.to_string();
     }
-    let Some(previous_scope) = previous_scope.filter(|scope| !scope.trim().is_empty()) else {
+    let Some(previous_scope) = previous_scope
+        .filter(|scope| !scope.trim().is_empty())
+        .and_then(safe_active_scope_context)
+    else {
         return latest_prompt.to_string();
     };
     format!("{previous_scope}\n{latest_prompt}")
+}
+
+fn safe_active_scope_context(scope: &str) -> Option<String> {
+    let safe = scope
+        .lines()
+        .filter(|line| {
+            let normalized = line.to_ascii_lowercase();
+            (normalized.contains("do not run tools") || normalized.contains("read-only"))
+                && !normalized.contains("critical:")
+                && !normalized.contains("scope-extraction")
+                && !normalized.contains("reply with text only")
+                && !normalized.contains("no preamble")
+                && !normalized.contains("being codex")
+                && !normalized.contains("do not run tools or edit files")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!safe.is_empty()).then_some(safe)
 }
 
 fn latest_prompt_releases_no_tools(prompt: &str) -> bool {
@@ -294,12 +315,17 @@ fn sanitize_scope_line(
             || normalized.contains("no preamble about being codex"));
     let has_reply_wrapper =
         normalized.contains("reply with text only") && normalized.contains("no preamble");
+    let has_split_preamble = normalized.trim_start().starts_with("no preamble about")
+        && normalized.trim_end().ends_with("being");
+    let has_split_scope_response = normalized.trim_end().ends_with("scope-extraction");
     let has_incomplete_wrapper = normalized.trim_end().ends_with("do not run tools")
         || normalized.trim_end().ends_with("do not run tools or")
         || normalized.trim_end().ends_with("do not run tools or edit")
         || normalized.trim_end().ends_with("do not run")
         || normalized.trim_end().ends_with("do not")
         || is_reply_split_candidate(&normalized)
+        || has_split_preamble
+        || has_split_scope_response
         || normalized.contains("critical:")
             && normalized.contains("do not run tools")
             && normalized.trim_end().ends_with("edit");
@@ -325,7 +351,11 @@ fn sanitize_scope_line(
         || has_incomplete_wrapper
     {
         if has_incomplete_wrapper {
-            if preserve_no_tools {
+            if has_split_preamble {
+                clean = truncate_case_insensitive(&clean, "no preamble about");
+            } else if has_split_scope_response {
+                clean = truncate_case_insensitive(&clean, "scope-extraction");
+            } else if preserve_no_tools {
                 clean = remove_case_insensitive(&clean, "critical:");
                 if is_reply_split_candidate(&normalized) {
                     clean = truncate_case_insensitive(&clean, "reply with");
@@ -511,6 +541,12 @@ fn is_wrapped_wrapper_prefix(line: &str) -> Option<&'static str> {
             && normalized.trim_end().ends_with("edit"))
     {
         Some("files")
+    } else if normalized.trim_start().starts_with("no preamble about")
+        && normalized.trim_end().ends_with("being")
+    {
+        Some("codex")
+    } else if normalized.trim_end().ends_with("scope-extraction") {
+        Some("response")
     } else if is_reply_split_candidate(&normalized)
         && normalized.trim_end().ends_with("reply with text")
     {
@@ -527,7 +563,9 @@ fn is_reply_split_candidate(normalized: &str) -> bool {
     let normalized = normalized.trim_end();
     let ordinary_requirement = normalized.contains("should reply with")
         || normalized.contains("would reply with")
-        || normalized.contains("can reply with");
+        || normalized.contains("can reply with")
+        || normalized.contains("must reply with")
+        || normalized.contains("exact answer");
     !ordinary_requirement
         && (normalized.ends_with("reply with") || normalized.ends_with("reply with text"))
 }
@@ -658,6 +696,10 @@ fn scope_response_is_wrapper(input: &str) -> bool {
                 && !suffix.starts_with("should summarize active scope"))
     } else {
         summary
+            && prefix
+                .to_ascii_lowercase()
+                .trim_matches(|ch: char| ch.is_whitespace() || ".,!".contains(ch))
+                .ends_with("keep the active scope")
     }
 }
 
@@ -1692,6 +1734,16 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn derived_wrapper_scope_does_not_create_user_provenance() {
+        let derived =
+            "- CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+        let active_prompt = active_scope_prompt(Some(derived), "Continue the review.");
+        let clean = sanitize_scope_requirements(derived, Some(&active_prompt));
+
+        assert!(clean.is_empty());
+    }
+
+    #[test]
     fn explicit_tool_authorization_retires_previous_no_tools_constraint() {
         let previous = "- Do not run tools. Keep this read-only review.";
         let active_prompt =
@@ -1788,6 +1840,16 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn arbitrary_multiline_wrapper_fragments_are_removed() {
+        assert!(sanitize_scope_requirements("No preamble about being\nCodex.", None).is_empty());
+
+        let clean =
+            sanitize_scope_requirements("scope-extraction\nresponse: keep editing SMS-005", None);
+        assert!(clean.contains("keep editing SMS-005"));
+        assert!(!clean.contains("scope-extraction"));
+    }
+
+    #[test]
     fn partial_critical_wrapper_fragments_are_removed() {
         for poisoned in [
             "CRITICAL: No preamble about being Codex.",
@@ -1841,8 +1903,23 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn scope_response_with_genuine_prefix_is_untouched() {
+        let requirement =
+            "The output must contain the scope-extraction response: summarize active scope.";
+
+        assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
+    }
+
+    #[test]
     fn ordinary_reply_with_requirement_is_untouched() {
         let requirement = "Document what the reviewer should reply with.";
+
+        assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
+    }
+
+    #[test]
+    fn must_reply_with_requirement_is_untouched() {
+        let requirement = "Document the exact answer the reviewer must reply with";
 
         assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
     }
