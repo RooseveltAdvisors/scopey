@@ -5,7 +5,8 @@ use crate::session::{hash_prompt, SessionMessage, SessionStore, ToolEvent};
 use crate::tool_journal::{counts_toward_n, preview_tool_input};
 use crate::trajectory::{
     build_correction_injection_with_prompt, build_reminder_injection_with_prompt,
-    drain_pending_jobs, spawn_background_judge, spawn_background_summarize, transcript_len,
+    drain_pending_jobs, sanitized_scope_requirements_for_injection, spawn_background_judge,
+    spawn_background_summarize, transcript_len,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -681,9 +682,9 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
 
     // 1) Apply ready off-track/warning judgement (lags previous window ≈ 2N)
     if let Some(j) = store.ready_judgement_for_injection().cloned() {
-        let scope = store
-            .latest_scope_requirements()
-            .unwrap_or_else(|| "(scope requirements not ready yet)".into());
+        let scope =
+            sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
+                .unwrap_or_else(|| "(scope requirements not ready yet)".into());
         let summary = j.summary.clone().unwrap_or_default();
         let details = j.details.clone().unwrap_or_default();
         let verdict = j
@@ -719,7 +720,9 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
 
     // 2) Periodic scope reminder
     if !injected && count > 0 && count % m == 0 && store.data.last_reminder_at_count != count {
-        if let Some(scope) = store.latest_scope_requirements() {
+        if let Some(scope) =
+            sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
+        {
             let text = build_reminder_injection_with_prompt(&scope, latest_user_prompt.as_deref());
             store.append(SessionMessage::injection("reminder", &text, count));
             store.data.last_reminder_at_count = count;
@@ -852,9 +855,9 @@ pub fn stop(cfg: &Config) -> Result<()> {
     let _ = store.expire_stale_judgements(count, max_lag);
 
     if let Some(j) = store.ready_judgement_for_injection().cloned() {
-        let scope = store
-            .latest_scope_requirements()
-            .unwrap_or_else(|| "(scope requirements not ready yet)".into());
+        let scope =
+            sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
+                .unwrap_or_else(|| "(scope requirements not ready yet)".into());
         let summary = j.summary.clone().unwrap_or_default();
         let details = j.details.clone().unwrap_or_default();
         let verdict = j

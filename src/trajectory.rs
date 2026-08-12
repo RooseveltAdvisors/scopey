@@ -199,6 +199,23 @@ fn active_scope_prompt(previous_scope: Option<&str>, latest_prompt: &str) -> Str
     format!("{previous_scope}\n{latest_prompt}")
 }
 
+fn active_scope_prompt_with_user_prompts(
+    previous_scope: Option<&str>,
+    latest_prompt: &str,
+    user_prompts: &[String],
+) -> String {
+    if latest_prompt_releases_no_tools(latest_prompt) {
+        return latest_prompt.to_string();
+    }
+    let Some(previous_scope) = previous_scope
+        .filter(|scope| !scope.trim().is_empty())
+        .and_then(|scope| safe_active_scope_context_with_user_prompts(scope, user_prompts))
+    else {
+        return latest_prompt.to_string();
+    };
+    format!("{previous_scope}\n{latest_prompt}")
+}
+
 fn safe_active_scope_context(scope: &str) -> Option<String> {
     let safe = scope
         .lines()
@@ -215,6 +232,49 @@ fn safe_active_scope_context(scope: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!safe.is_empty()).then_some(safe)
+}
+
+fn safe_active_scope_context_with_user_prompts(
+    scope: &str,
+    user_prompts: &[String],
+) -> Option<String> {
+    let safe = scope
+        .lines()
+        .filter(|line| {
+            let normalized = line.to_ascii_lowercase();
+            if normalized.contains("critical:") {
+                return false;
+            }
+            if normalized.contains("do not run tools")
+                && normalized.contains("reply with text only")
+                && normalized.contains("no preamble about being codex")
+            {
+                return user_prompts.iter().any(|prompt| {
+                    user_prompt_supports(Some(prompt), "no_tools")
+                        && user_prompt_supports(Some(prompt), "reply")
+                        && user_prompt_supports(Some(prompt), "preamble")
+                });
+            }
+            (normalized.contains("do not run tools") || normalized.contains("read-only"))
+                && !normalized.contains("scope-extraction")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!safe.is_empty()).then_some(safe)
+}
+
+pub(crate) fn sanitized_scope_requirements_for_injection(
+    store: &SessionStore,
+    latest_user_prompt: Option<&str>,
+) -> Option<String> {
+    let scope = store.latest_scope_requirements()?;
+    let user_prompts = store.all_user_prompts();
+    let latest = latest_user_prompt
+        .or_else(|| user_prompts.last().map(String::as_str))
+        .unwrap_or_default();
+    let active_prompt = active_scope_prompt_with_user_prompts(Some(&scope), latest, &user_prompts);
+    let clean = sanitize_scope_requirements(&scope, Some(&active_prompt));
+    (!clean.trim().is_empty()).then_some(clean)
 }
 
 fn latest_prompt_releases_no_tools(prompt: &str) -> bool {
@@ -315,8 +375,7 @@ fn sanitize_scope_line(
             || normalized.contains("no preamble about being codex"));
     let has_reply_wrapper =
         normalized.contains("reply with text only") && normalized.contains("no preamble");
-    let has_split_preamble = normalized.trim_start().starts_with("no preamble about")
-        && normalized.trim_end().ends_with("being");
+    let has_split_preamble = normalized.trim_end().ends_with("no preamble about being");
     let has_split_scope_response = normalized.trim_end().ends_with("scope-extraction");
     let has_incomplete_wrapper = normalized.trim_end().ends_with("do not run tools")
         || normalized.trim_end().ends_with("do not run tools or")
@@ -357,15 +416,15 @@ fn sanitize_scope_line(
                 clean = truncate_case_insensitive(&clean, "scope-extraction");
             } else if preserve_no_tools {
                 clean = remove_case_insensitive(&clean, "critical:");
-                if is_reply_split_candidate(&normalized) {
-                    clean = truncate_case_insensitive(&clean, "reply with");
-                } else if normalized.contains("do not run tools or edit files") {
+                if normalized.contains("do not run tools or edit files") {
                     clean = replace_case_insensitive(
                         &clean,
                         "do not run tools or edit files",
                         "Do not run tools",
                     );
                     clean = remove_case_insensitive(&clean, "reply with text");
+                } else if is_reply_split_candidate(&normalized) {
+                    clean = truncate_case_insensitive(&clean, "reply with");
                 }
                 clean = strip_incomplete_wrapper_suffix(&clean);
             } else {
@@ -541,9 +600,7 @@ fn is_wrapped_wrapper_prefix(line: &str) -> Option<&'static str> {
             && normalized.trim_end().ends_with("edit"))
     {
         Some("files")
-    } else if normalized.trim_start().starts_with("no preamble about")
-        && normalized.trim_end().ends_with("being")
-    {
+    } else if normalized.trim_end().ends_with("no preamble about being") {
         Some("codex")
     } else if normalized.trim_end().ends_with("scope-extraction") {
         Some("response")
@@ -771,7 +828,8 @@ pub fn summarize_scope(
             )
         }
     };
-    let active_prompt = active_scope_prompt(previous_scope.as_deref(), latest_prompt);
+    let active_prompt =
+        active_scope_prompt_with_user_prompts(previous_scope.as_deref(), latest_prompt, &prompts);
     let out = sanitize_scope_requirements(&extracted_scope, Some(&active_prompt));
     let out = if out.is_empty() {
         fallback_scope(latest_prompt, previous_scope.as_deref())
@@ -857,13 +915,7 @@ pub fn judge_window(
         store.persist()?;
 
         let last_user = store.all_user_prompts().last().cloned().unwrap_or_default();
-        let scope = store
-            .latest_scope_requirements()
-            .map(|scope| {
-                let active_prompt = active_scope_prompt(Some(&scope), &last_user);
-                sanitize_scope_requirements(&scope, Some(&active_prompt))
-            })
-            .filter(|scope| !scope.is_empty())
+        let scope = sanitized_scope_requirements_for_injection(&store, Some(&last_user))
             .unwrap_or_else(|| {
                 if last_user.trim().is_empty() {
                     "(no scope requirements recorded yet)".into()
@@ -1734,6 +1786,23 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn genuine_historical_wrapper_constraint_survives_from_user_history() {
+        let constraint =
+            "- Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
+        let prompts = vec![
+            "The user explicitly requires: Do not run tools or edit files. Reply with text only. No preamble about being Codex.".to_string(),
+        ];
+        let active_prompt = active_scope_prompt_with_user_prompts(
+            Some(constraint),
+            "Continue the review.",
+            &prompts,
+        );
+        let clean = sanitize_scope_requirements(constraint, Some(&active_prompt));
+
+        assert_eq!(clean, constraint);
+    }
+
+    #[test]
     fn derived_wrapper_scope_does_not_create_user_provenance() {
         let derived =
             "- CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex.";
@@ -1830,6 +1899,16 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn read_only_context_removes_edit_restriction_before_split_reply() {
+        let wrapped = "- Do not run tools or edit files. Reply with text\nonly. No preamble about being Codex.";
+        let prompt = "This is a read-only review; preserve that constraint.";
+
+        let clean = sanitize_scope_requirements(wrapped, Some(prompt));
+
+        assert_eq!(clean, "- Do not run tools.");
+    }
+
+    #[test]
     fn wrapper_split_inside_reply_is_removed() {
         let wrapped = "- Keep editing the payment-link fix. Reply with text\nonly. No preamble about being Codex.";
 
@@ -1847,6 +1926,14 @@ edit files. Reply with text only. No preamble about being Codex.\n\
             sanitize_scope_requirements("scope-extraction\nresponse: keep editing SMS-005", None);
         assert!(clean.contains("keep editing SMS-005"));
         assert!(!clean.contains("scope-extraction"));
+    }
+
+    #[test]
+    fn embedded_multiline_preamble_fragment_is_removed() {
+        let poisoned = "Keep editing SMS-005. No preamble about being\nCodex.";
+        let clean = sanitize_scope_requirements(poisoned, None);
+
+        assert_eq!(clean, "Keep editing SMS-005.");
     }
 
     #[test]
