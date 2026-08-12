@@ -161,16 +161,6 @@ fn extract_scope_transition(output: &str) -> (String, String) {
 }
 
 #[derive(Clone, Copy, Default)]
-struct UserConstraintSupport {
-    no_tools: bool,
-    no_shell: bool,
-    no_edits: bool,
-    reply: bool,
-    preamble: bool,
-    scope_response: bool,
-}
-
-#[derive(Clone, Copy, Default)]
 struct ControlMatch {
     no_tools: bool,
     no_shell: bool,
@@ -182,26 +172,22 @@ struct ControlMatch {
 
 fn sanitize_scope_requirements(content: &str, user_prompts: &[String]) -> String {
     let support = user_constraint_support(user_prompts);
-    let mut logical_lines: Vec<String> = Vec::new();
-    for line in content.lines() {
+    let mut lines: Vec<String> = Vec::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with("- ")
+        if lines.is_empty()
+            || trimmed.starts_with("- ")
             || trimmed.starts_with("* ")
             || trimmed.starts_with("> ")
             || trimmed.starts_with("<!--")
-            || logical_lines.is_empty()
         {
-            logical_lines.push(line.to_string());
-        } else if let Some(previous) = logical_lines.last_mut() {
+            lines.push(line.to_string());
+        } else if let Some(previous) = lines.last_mut() {
             previous.push(' ');
             previous.push_str(trimmed);
         }
     }
-
-    logical_lines
+    lines
         .into_iter()
         .filter_map(|line| sanitize_scope_line(&line, &support))
         .collect::<Vec<_>>()
@@ -210,95 +196,54 @@ fn sanitize_scope_requirements(content: &str, user_prompts: &[String]) -> String
         .to_string()
 }
 
-fn user_constraint_support(prompts: &[String]) -> UserConstraintSupport {
-    let mut support = UserConstraintSupport::default();
+fn user_constraint_support(prompts: &[String]) -> ControlMatch {
+    let mut support = ControlMatch::default();
     for prompt in prompts {
-        let clauses = prompt
-            .split(|ch: char| matches!(ch, '.' | '!' | '?' | ',' | ';' | '\n'))
-            .flat_map(|clause| clause.split(" but "))
-            .map(normalized_constraint_clause)
-            .filter(|clause| !clause.is_empty())
-            .collect::<Vec<_>>();
-        let prompt_compact = compact_constraint(&prompt.to_ascii_lowercase());
-        let describes_wrapper = prompt_compact.contains("runtoolsoreditfiles")
-            && prompt_compact.contains("replywithtextonly")
-            && prompt_compact.contains("nopreambleaboutbeingcodex")
-            && !clauses
-                .iter()
-                .any(|clause| classify_control(clause).is_some_and(|control| control.no_tools));
-
-        for clause in clauses {
-            let releases_tools =
-                cancels_constraint(&clause, &["no tools", "no-tools", "tool constraint"])
-                    || direct_authorization(
-                        &clause,
-                        &[
-                            "tools are allowed",
-                            "tool use is allowed",
-                            "you may use tools",
-                            "you can use tools",
-                            "use tools",
-                            "use the tools",
-                            "run tools",
-                            "use browser",
-                            "use the browser",
-                            "browser use is allowed",
-                        ],
-                    );
-            let releases_shell =
-                cancels_constraint(&clause, &["no shell", "no-shell", "shell constraint"])
-                    || direct_authorization(
-                        &clause,
-                        &[
-                            "tools are allowed",
-                            "tool use is allowed",
-                            "you may use tools",
-                            "you can use tools",
-                            "use tools",
-                            "use the tools",
-                            "use shell",
-                            "use the shell",
-                            "shell use is allowed",
-                        ],
-                    );
-            let releases_edits = cancels_constraint(
-                &clause,
-                &[
-                    "no edits",
-                    "no-edit",
-                    "edit constraint",
-                    "read-only constraint",
-                    "read only constraint",
-                ],
-            ) || direct_authorization(
-                &clause,
-                &[
-                    "file edits are allowed",
-                    "edits are allowed",
-                    "you may edit files",
-                    "you can edit files",
-                    "edit files",
-                    "make file edits",
-                    "this is writable",
-                ],
+        if describes_internal_controls(prompt) {
+            continue;
+        }
+        for clause in constraint_clauses(prompt) {
+            let compact = compact_constraint(&clause);
+            let negative = contains_one(
+                &compact,
+                "notforthistask|notforthisreview|donot|dont|maynot|cannot|cant|never|mustnot",
             );
-
-            if releases_tools || releases_shell {
+            let tools = cancels(&compact, "notools|toolconstraint")
+                || (!negative
+                    && starts_one(
+                        &compact,
+                        "toolsareallowed|tooluseisallowed|youmayusetools|youcanusetools|usetools|usethetools|runtools",
+                    ));
+            let browser = !negative
+                && starts_one(
+                    &compact,
+                    "usebrowser|usethebrowser|browseruseisallowed|youmayusethebrowser",
+                );
+            let shell = cancels(&compact, "noshell|shellconstraint")
+                || (!negative
+                    && starts_one(
+                        &compact,
+                        "shelluseisallowed|youmayuseshell|youcanuseshell|useshell|usetheshell",
+                    ));
+            let edits = cancels(&compact, "noedits|editconstraint|readonlyconstraint")
+                || (!negative
+                    && starts_one(
+                        &compact,
+                        "fileeditsareallowed|editsareallowed|youmayeditfiles|youcaneditfiles|editfiles|makefileedits|thisiswritable",
+                    ));
+            if tools || browser || shell {
                 support.no_tools = false;
             }
-            if releases_shell {
+            if tools || shell {
                 support.no_shell = false;
             }
-            if releases_edits {
+            if edits {
                 support.no_edits = false;
             }
-            if describes_wrapper {
-                continue;
-            }
-            if let Some(control) = classify_control(&clause) {
-                support.no_tools |= control.no_tools && !releases_tools;
-                support.no_shell |= control.no_shell && !releases_shell;
-                support.no_edits |= control.no_edits && !releases_edits;
+            if let Some((control, _)) = control_prefix(&clause) {
+                support.no_tools |= control.no_tools;
+                support.no_shell |= control.no_shell;
+                support.no_edits |= control.no_edits;
                 support.reply |= control.reply;
                 support.preamble |= control.preamble;
                 support.scope_response |= control.scope_response;
@@ -307,98 +252,80 @@ fn user_constraint_support(prompts: &[String]) -> UserConstraintSupport {
     }
     support
 }
-fn normalized_constraint_clause(clause: &str) -> String {
-    let mut lower = clause
-        .trim()
-        .trim_start_matches(['-', '*', '>', '`'])
-        .trim()
-        .to_ascii_lowercase();
-    loop {
-        let mut stripped = false;
-        for prefix in [
-            "please ",
-            "but ",
-            "and ",
-            "you must ",
-            "the agent must ",
-            "the user explicitly requires: ",
-            "user explicitly requires: ",
-        ] {
-            if let Some(rest) = lower.strip_prefix(prefix) {
-                lower = rest.trim().to_string();
-                stripped = true;
-                break;
-            }
-        }
-        if !stripped {
-            return lower;
-        }
-    }
+
+fn constraint_clauses(prompt: &str) -> Vec<String> {
+    prompt
+        .replace('’', "'")
+        .to_ascii_lowercase()
+        .split(|ch: char| matches!(ch, '.' | '!' | '?' | ',' | ';' | '\n'))
+        .flat_map(|part| part.split(" but "))
+        .flat_map(|part| part.split(" and "))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn compact_constraint(value: &str) -> String {
-    value.chars().filter(|ch| !ch.is_whitespace()).collect()
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
-fn starts_any(value: &str, prefixes: &[&str]) -> bool {
-    prefixes.iter().any(|prefix| value.starts_with(prefix))
+fn starts_one(value: &str, choices: &str) -> bool {
+    choices.split('|').any(|choice| value.starts_with(choice))
 }
 
-fn direct_authorization(clause: &str, phrases: &[&str]) -> bool {
-    if [
-        "not for this task",
-        "not for this review",
-        "do not ",
-        "don't ",
-        "may not ",
-        "cannot ",
-        "can't ",
-        "never ",
-        "must not ",
-    ]
-    .iter()
-    .any(|negative| clause.contains(negative))
-    {
-        return false;
+fn contains_one(value: &str, choices: &str) -> bool {
+    choices.split('|').any(|choice| value.contains(choice))
+}
+
+fn cancels(value: &str, subjects: &str) -> bool {
+    contains_one(value, subjects)
+        && contains_one(
+            value,
+            "islifted|arelifted|isremoved|areremoved|iscancelled|iscanceled|nolongerapplies|nolongerrequired",
+        )
+}
+
+fn describes_internal_controls(prompt: &str) -> bool {
+    let lower = prompt.replace('’', "'").to_ascii_lowercase();
+    if let Some(colon) = lower.find(':') {
+        let before = compact_constraint(&lower[..colon]);
+        let after = compact_constraint(&lower[colon + 1..]);
+        let allowed = starts_one(
+            &before,
+            "forthistask|forthisreview|forthisreadonlyaudit|theuserexplicitlyrequires|userexplicitlyrequires",
+        );
+        if !allowed
+            && starts_one(
+                &after,
+                "donotruntools|dontruntools|cannotruntools|cantruntools|replywithtextonly|nopreambleaboutbeingcodex",
+            )
+        {
+            return true;
+        }
     }
-    phrases.iter().any(|phrase| {
-        clause.strip_prefix(phrase).is_some_and(|rest| {
-            rest.is_empty()
-                || rest
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_whitespace() || ch.is_ascii_punctuation())
-        })
-    })
+    let compact = compact_constraint(&lower);
+    let full_wrapper = contains_one(
+        &compact,
+        "donotruntoolsoreditfiles|dontruntoolsoreditfiles|cannotruntoolsoreditfiles|cantruntoolsoreditfiles",
+    ) && compact.contains("replywithtextonly")
+        && compact.contains("nopreambleaboutbeingcodex");
+    full_wrapper
+        && !constraint_clauses(&lower)
+            .iter()
+            .any(|clause| control_prefix(clause).is_some_and(|(control, _)| control.no_tools))
 }
 
-fn cancels_constraint(clause: &str, subjects: &[&str]) -> bool {
-    subjects.iter().any(|subject| clause.contains(subject))
-        && [
-            "is lifted",
-            "are lifted",
-            "is removed",
-            "are removed",
-            "is cancelled",
-            "is canceled",
-            "no longer applies",
-            "no longer required",
-        ]
-        .iter()
-        .any(|signal| clause.contains(signal))
-}
-
-fn sanitize_scope_line(line: &str, support: &UserConstraintSupport) -> Option<String> {
+fn sanitize_scope_line(line: &str, support: &ControlMatch) -> Option<String> {
     let trimmed = line.trim();
-    let (marker, body) = if let Some(body) = trimmed.strip_prefix("- ") {
-        ("- ", body)
-    } else if let Some(body) = trimmed.strip_prefix("* ") {
-        ("* ", body)
-    } else if let Some(body) = trimmed.strip_prefix("> ") {
-        ("> ", body)
-    } else {
-        ("", trimmed)
-    };
+    let (marker, body) = ["- ", "* ", "> "]
+        .iter()
+        .find_map(|marker| trimmed.strip_prefix(marker).map(|body| (*marker, body)))
+        .unwrap_or(("", trimmed));
     if body
         .trim_start()
         .to_ascii_lowercase()
@@ -406,157 +333,248 @@ fn sanitize_scope_line(line: &str, support: &UserConstraintSupport) -> Option<St
     {
         return None;
     }
-
-    let clean = split_sentences(body)
+    let clean = split_scope_segments(body)
         .into_iter()
-        .filter_map(|sentence| sanitize_scope_sentence(sentence, support))
+        .filter_map(|segment| sanitize_scope_segment(segment, support))
         .collect::<Vec<_>>()
         .join(" ");
-    let clean = clean.trim();
-    (!clean.is_empty()).then(|| format!("{marker}{clean}"))
+    (!clean.trim().is_empty()).then(|| format!("{marker}{}", clean.trim()))
 }
 
-fn split_sentences(input: &str) -> Vec<&str> {
-    let mut sentences = Vec::new();
+fn split_scope_segments(input: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
     let mut start = 0;
     for (index, ch) in input.char_indices() {
-        if matches!(ch, '.' | '!' | '?') {
+        if matches!(ch, '.' | '!' | '?' | ';') {
             let end = index + ch.len_utf8();
             if !input[start..end].trim().is_empty() {
-                sentences.push(&input[start..end]);
+                segments.push(&input[start..end]);
             }
             start = end;
         }
     }
     if !input[start..].trim().is_empty() {
-        sentences.push(&input[start..]);
+        segments.push(&input[start..]);
     }
-    sentences
+    segments
 }
 
-fn sanitize_scope_sentence(sentence: &str, support: &UserConstraintSupport) -> Option<String> {
-    let sentence = sentence.trim();
-    let lower = sentence.to_ascii_lowercase();
-    if let Some(start) = lower.find("critical:") {
-        let suffix_start = start + "critical:".len();
-        if let Some(control) = classify_control(&sentence[suffix_start..]) {
+fn sanitize_scope_segment(segment: &str, support: &ControlMatch) -> Option<String> {
+    let segment = segment.trim();
+    if let Some(index) = segment.to_ascii_lowercase().find("critical:") {
+        let after = &segment[index + "critical:".len()..];
+        if control_prefix(after).is_some() {
             let mut parts = Vec::new();
-            let prefix = sentence[..start].trim();
-            if !prefix.is_empty() {
-                parts.push(prefix.to_string());
+            if let Some(prefix) = sanitize_scope_segment(&segment[..index], support) {
+                parts.push(prefix);
             }
-            if let Some(supported) = supported_controls(control, support) {
-                parts.push(supported);
+            if let Some(suffix) = sanitize_control_segment(after, support, true) {
+                parts.push(suffix);
             }
             return (!parts.is_empty()).then(|| parts.join(" "));
         }
     }
+    sanitize_control_segment(segment, support, false)
+}
 
-    let Some(control) = classify_control(sentence) else {
-        return Some(sentence.to_string());
+fn sanitize_control_segment(
+    segment: &str,
+    support: &ControlMatch,
+    internal: bool,
+) -> Option<String> {
+    let Some((control, end)) = control_prefix(segment) else {
+        return Some(segment.trim().to_string());
     };
-    if control_is_supported(control, support) {
-        Some(sentence.to_string())
-    } else {
-        supported_controls(control, support)
+    if control.scope_response {
+        return support.scope_response.then(|| segment.trim().to_string());
     }
-}
-
-fn classify_control(sentence: &str) -> Option<ControlMatch> {
-    let normalized = normalized_constraint_clause(sentence);
-    let compact = compact_constraint(
-        normalized.trim_matches(|ch: char| ch.is_ascii_punctuation() || ch == '“' || ch == '”'),
-    );
-    if compact.starts_with("scope-extractionresponse") {
-        return Some(ControlMatch {
-            scope_response: true,
-            ..ControlMatch::default()
-        });
-    }
-
-    let mut control = ControlMatch::default();
-    if starts_any(
-        &compact,
-        &[
-            "donotruntools",
-            "don'truntools",
-            "cannotruntools",
-            "can'truntools",
-            "neverruntools",
-            "mustnotruntools",
-            "donotusetools",
-            "don'tusetools",
-            "notools",
-        ],
-    ) {
-        control.no_tools = true;
-        control.no_edits = compact.contains("oreditfiles")
-            || compact.contains("anddonoteditfiles")
-            || compact.contains("anddon'teditfiles");
-    } else if starts_any(
-        &compact,
-        &[
-            "donotuseshell",
-            "don'tuseshell",
-            "cannotuseshell",
-            "can'tuseshell",
-            "neveruseshell",
-            "mustnotuseshell",
-            "noshell",
-        ],
-    ) {
-        control.no_shell = true;
-    } else if starts_any(
-        &compact,
-        &[
-            "donoteditfiles",
-            "don'teditfiles",
-            "cannoteditfiles",
-            "can'teditfiles",
-            "nevereditfiles",
-            "mustnoteditfiles",
-            "noedits",
-            "thisisread-only",
-            "thisisreadonly",
-            "thistaskisread-only",
-            "thistaskisreadonly",
-            "thisreviewisread-only",
-            "thisreviewisreadonly",
-            "keepthisread-only",
-            "keepthisreadonly",
-            "remainread-only",
-            "remainreadonly",
-            "forthisread-only",
-            "forthisreadonly",
-            "read-only",
-            "readonly",
-        ],
-    ) {
-        control.no_edits = true;
-        control.no_shell = compact.contains("oruseshell");
-    } else if compact.starts_with("replywithtextonly") {
-        control.reply = true;
-    } else if compact.starts_with("nopreambleaboutbeingcodex") || compact == "nopreamble" {
-        control.preamble = true;
-    } else {
-        return None;
-    }
-
-    control.reply |= compact.contains("replywithtextonly");
-    control.preamble |= compact.contains("nopreambleaboutbeingcodex");
-    Some(control)
-}
-
-fn control_is_supported(control: ControlMatch, support: &UserConstraintSupport) -> bool {
-    (!control.no_tools || support.no_tools)
+    let fully_supported = (!control.no_tools || support.no_tools)
         && (!control.no_shell || support.no_shell)
         && (!control.no_edits || support.no_edits)
         && (!control.reply || support.reply)
-        && (!control.preamble || support.preamble)
-        && (!control.scope_response || support.scope_response)
+        && (!control.preamble || support.preamble);
+    if !internal && fully_supported {
+        return Some(segment.trim().to_string());
+    }
+
+    let mut parts = supported_controls(control, support)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let remainder = segment[end..]
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation())
+        .trim();
+    if !remainder.is_empty() {
+        parts.push(remainder.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-fn supported_controls(control: ControlMatch, support: &UserConstraintSupport) -> Option<String> {
+fn control_prefix(value: &str) -> Option<(ControlMatch, usize)> {
+    let words = control_words(value);
+    let starts = |at, expected: &[&str]| {
+        words.get(at..at + expected.len()).is_some_and(|actual| {
+            actual
+                .iter()
+                .map(|word| word.0.as_str())
+                .eq(expected.iter().copied())
+        })
+    };
+    let mut at = 0;
+    for prefix in [
+        &["please"][..],
+        &["but"][..],
+        &["and"][..],
+        &["you", "must"][..],
+        &["the", "agent", "must"][..],
+        &["user", "explicitly", "requires"][..],
+        &["the", "user", "explicitly", "requires"][..],
+    ] {
+        if starts(at, prefix) {
+            at += prefix.len();
+            break;
+        }
+    }
+    let finish = |control, count: usize| Some((control, words.get(count - 1)?.1));
+    if starts(at, &["scopeextraction", "response"])
+        || starts(at, &["scope", "extraction", "response"])
+    {
+        return finish(
+            ControlMatch {
+                scope_response: true,
+                ..Default::default()
+            },
+            at + if starts(at, &["scopeextraction", "response"]) {
+                2
+            } else {
+                3
+            },
+        );
+    }
+    if starts(at, &["reply", "with", "text", "only"]) {
+        return finish(
+            ControlMatch {
+                reply: true,
+                ..Default::default()
+            },
+            at + 4,
+        );
+    }
+    if starts(at, &["no", "preamble", "about", "being", "codex"]) {
+        return finish(
+            ControlMatch {
+                preamble: true,
+                ..Default::default()
+            },
+            at + 5,
+        );
+    }
+    if starts(at, &["no", "preamble"]) {
+        return finish(
+            ControlMatch {
+                preamble: true,
+                ..Default::default()
+            },
+            at + 2,
+        );
+    }
+
+    for pattern in [
+        &["this", "is", "a", "readonly"][..],
+        &["this", "is", "readonly"][..],
+        &["this", "task", "is", "readonly"][..],
+        &["this", "review", "is", "readonly"][..],
+        &["keep", "this", "readonly"][..],
+        &["remain", "readonly"][..],
+        &["for", "this", "readonly"][..],
+        &["readonly"][..],
+    ] {
+        if starts(at, pattern) {
+            return finish(
+                ControlMatch {
+                    no_edits: true,
+                    ..Default::default()
+                },
+                at + pattern.len(),
+            );
+        }
+    }
+
+    let negation = if starts(at, &["do", "not"]) || starts(at, &["must", "not"]) {
+        2
+    } else if ["dont", "cannot", "cant", "never"]
+        .iter()
+        .any(|word| starts(at, &[*word]))
+    {
+        1
+    } else if starts(at, &["no"]) {
+        1
+    } else {
+        return None;
+    };
+    let target = at + negation;
+    if starts(target, &["run", "tools"])
+        || starts(target, &["use", "tools"])
+        || starts(target, &["tools"])
+    {
+        let target_len = if starts(target, &["tools"]) { 1 } else { 2 };
+        let mut end = target + target_len;
+        let mut control = ControlMatch {
+            no_tools: true,
+            ..Default::default()
+        };
+        if starts(end, &["or", "edit", "files"]) {
+            control.no_edits = true;
+            end += 3;
+        } else if starts(end, &["and", "do", "not", "edit", "files"]) {
+            control.no_edits = true;
+            end += 5;
+        }
+        return finish(control, end);
+    }
+    if starts(target, &["use", "shell"]) || starts(target, &["shell"]) {
+        let end = target + if starts(target, &["shell"]) { 1 } else { 2 };
+        return finish(
+            ControlMatch {
+                no_shell: true,
+                ..Default::default()
+            },
+            end,
+        );
+    }
+    if starts(target, &["edit", "files"]) || starts(target, &["edits"]) {
+        let mut end = target + if starts(target, &["edits"]) { 1 } else { 2 };
+        let mut control = ControlMatch {
+            no_edits: true,
+            ..Default::default()
+        };
+        if starts(end, &["or", "use", "shell"]) {
+            control.no_shell = true;
+            end += 3;
+        }
+        return finish(control, end);
+    }
+    None
+}
+
+fn control_words(value: &str) -> Vec<(String, usize)> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for (index, ch) in value.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            word.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '\'' | '’') && !word.is_empty() {
+            continue;
+        } else if !word.is_empty() {
+            words.push((std::mem::take(&mut word), index));
+        }
+    }
+    if !word.is_empty() {
+        words.push((word, value.len()));
+    }
+    words
+}
+
+fn supported_controls(control: ControlMatch, support: &ControlMatch) -> Option<String> {
     let mut constraints = Vec::new();
     if control.no_tools && support.no_tools {
         constraints.push("Do not run tools.");
@@ -725,10 +743,15 @@ pub fn summarize_scope(
     if let Some(c) = &completion {
         store.record_analyzer_usage("summarize", c);
     }
+    let summary_is_current = hash_prompt(&store.all_user_prompts().join("\n\n---\n\n")) == hash;
     let mut scope_message = SessionMessage::scope_requirements(out.trim(), Some(hash));
     scope_message.kind = Some(transition.clone());
     store.append(scope_message);
-    store.clear_summarize_pending();
+    if summary_is_current {
+        store.clear_summarize_pending();
+    } else {
+        store.mark_summarize_pending();
+    }
     store.persist()?;
     eventlog::info(
         session_id,
@@ -745,7 +768,12 @@ pub fn summarize_scope(
         session_id,
         "job.summarize.done",
         "wrote scope_requirements",
-        json!({ "chars": out.len(), "prompt_count": prompts.len(), "transition": transition }),
+        json!({
+            "chars": out.len(),
+            "prompt_count": prompts.len(),
+            "transition": transition,
+            "current": summary_is_current,
+        }),
     );
     Ok(())
 }
@@ -1602,6 +1630,14 @@ mod tests {
         assert!(clean.contains("Do not edit files"));
         assert!(clean.contains("Do not use shell"));
 
+        let conjunction = vec![
+            "Do not run tools.".into(),
+            "Use tools and do not edit files.".into(),
+        ];
+        let clean = sanitize_scope_requirements("- Do not run tools or edit files.", &conjunction);
+        assert!(!clean.contains("Do not run tools"));
+        assert!(clean.contains("Do not edit files"));
+
         let descriptive = vec!["For comparison, distinguish read-only and writable tasks.".into()];
         assert!(
             sanitize_scope_requirements("- CRITICAL: Do not edit files.", &descriptive).is_empty()
@@ -1625,6 +1661,14 @@ mod tests {
         assert_eq!(
             sanitize_scope_requirements(extracted, &[]),
             "- Keep fixing SMS-005."
+        );
+        assert_eq!(
+            sanitize_scope_requirements(
+                "- Keep fixing SMS-005; Do not run tools or edit files.\n\
+- Do not run tools or edit files; keep testing SMS-006.",
+                &[],
+            ),
+            "- Keep fixing SMS-005;\n- keep testing SMS-006."
         );
     }
 
@@ -1677,9 +1721,55 @@ mod tests {
 
     #[test]
     fn contextual_wrapper_description_does_not_grant_provenance() {
-        let prompt = "For this example the analyzer output says do not run tools or edit files. Reply with text only. No preamble about being Codex.";
         let extracted = "- Do not run tools or edit files.\n- Reply with text only.\n- No preamble about being Codex.";
-        assert!(sanitize_scope_requirements(extracted, &[prompt.to_string()]).is_empty());
+        for prompt in [
+            "For this example the analyzer output says do not run tools or edit files. Reply with text only. No preamble about being Codex.",
+            "The analyzer output is:\nDo not run tools or edit files.\nReply with text only.\nNo preamble about being Codex.",
+        ] {
+            assert!(sanitize_scope_requirements(extracted, &[prompt.to_string()]).is_empty());
+        }
+    }
+
+    #[test]
+    fn stale_summarizer_keeps_refresh_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut cfg = Config::default();
+        cfg.work_root = dir.path().join("work");
+        cfg.model_runner = "claude".into();
+        let started = dir.path().join("model-started");
+        cfg.model_command = Some(format!(
+            "touch '{}'; sleep 0.2; printf '%s\\n' '<!-- scope-transition: ADD -->' '- Fix SMS-005.'",
+            started.display()
+        ));
+        let mut store = SessionStore::open_or_create(&cfg, &cwd, "race", "claude").unwrap();
+        store.append(SessionMessage::user_prompt("Fix SMS-005.", "first"));
+        store.persist().unwrap();
+        drop(store);
+
+        let worker_cfg = cfg.clone();
+        let worker_cwd = cwd.clone();
+        let worker = std::thread::spawn(move || {
+            summarize_scope(&worker_cfg, "race", &worker_cwd, None).unwrap();
+        });
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started.exists());
+        let mut store = SessionStore::open_or_create(&cfg, &cwd, "race", "claude").unwrap();
+        store.append(SessionMessage::user_prompt("Also fix SMS-006.", "second"));
+        store.mark_summarize_pending();
+        store.persist().unwrap();
+        drop(store);
+        worker.join().unwrap();
+
+        let store = SessionStore::open_or_create(&cfg, &cwd, "race", "claude").unwrap();
+        assert!(store.data.summarize_pending);
+        assert!(sanitized_scope_requirements_for_injection(&store).is_none());
     }
 
     #[test]
