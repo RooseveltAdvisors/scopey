@@ -169,11 +169,12 @@ fn active_user_prompt_context(user_prompts: &[String], latest_prompt: &str) -> S
         .iter()
         .enumerate()
         .filter_map(|(index, prompt)| {
-            let prompt = if releases_no_tools && Some(index) != latest_index {
-                retire_tool_use_constraints(prompt, releases_file_edits)
-            } else {
-                prompt.to_string()
-            };
+            let prompt =
+                if (releases_no_tools || releases_file_edits) && Some(index) != latest_index {
+                    retire_constraints(prompt, releases_no_tools, releases_file_edits)
+                } else {
+                    prompt.to_string()
+                };
             (!prompt.trim().is_empty()).then_some(prompt)
         })
         .collect::<Vec<_>>();
@@ -183,33 +184,40 @@ fn active_user_prompt_context(user_prompts: &[String], latest_prompt: &str) -> S
     active.join("\n\n")
 }
 
-fn retire_tool_use_constraints(input: &str, release_file_edits: bool) -> String {
+fn retire_constraints(input: &str, release_no_tools: bool, release_file_edits: bool) -> String {
     let mut output = input.to_string();
-    for phrase in [
-        "do not run tools or edit files",
-        "don't run tools or edit files",
-        "cannot run tools or edit files",
-        "can't run tools or edit files",
-        "never run tools or edit files",
-        "must not run tools or edit files",
-        "mustn't run tools or edit files",
-        "do not use tools or edit files",
-        "don't use tools or edit files",
-        "cannot use tools or edit files",
-        "can't use tools or edit files",
-        "never use tools or edit files",
-        "must not use tools or edit files",
-        "mustn't use tools or edit files",
-    ] {
-        output = replace_case_insensitive(&output, phrase, "Do not edit files");
+    if release_file_edits && !release_no_tools {
+        output = normalize_no_tools_wrapper(&output);
     }
-    for phrase in EXPLICIT_TOOL_USE_CONSTRAINT_PHRASES {
-        output = remove_case_insensitive(&output, phrase);
+    if release_no_tools {
+        for phrase in [
+            "do not run tools or edit files",
+            "don't run tools or edit files",
+            "cannot run tools or edit files",
+            "can't run tools or edit files",
+            "never run tools or edit files",
+            "must not run tools or edit files",
+            "mustn't run tools or edit files",
+            "do not use tools or edit files",
+            "don't use tools or edit files",
+            "cannot use tools or edit files",
+            "can't use tools or edit files",
+            "never use tools or edit files",
+            "must not use tools or edit files",
+            "mustn't use tools or edit files",
+        ] {
+            output = replace_case_insensitive(&output, phrase, "Do not edit files");
+        }
+        for phrase in EXPLICIT_TOOL_USE_CONSTRAINT_PHRASES {
+            output = remove_case_insensitive(&output, phrase);
+        }
     }
     if release_file_edits {
         for phrase in EXPLICIT_NO_EDIT_CONSTRAINT_PHRASES {
             output = remove_case_insensitive(&output, phrase);
         }
+        output = remove_case_insensitive(&output, "read-only");
+        output = remove_case_insensitive(&output, "read only");
     }
     collapse_removed_wrapper_punctuation(&output)
         .trim()
@@ -311,12 +319,13 @@ fn sanitize_scope_requirements(content: &str, user_prompt: Option<&str>) -> Stri
 }
 
 fn active_scope_prompt(previous_scope: Option<&str>, latest_prompt: &str) -> String {
-    if latest_prompt_releases_no_tools(latest_prompt) {
-        return latest_prompt.to_string();
-    }
+    let releases_no_tools = latest_prompt_releases_no_tools(latest_prompt);
+    let releases_file_edits = latest_prompt_releases_file_edits(latest_prompt);
     let Some(previous_scope) = previous_scope
         .filter(|scope| !scope.trim().is_empty())
         .and_then(safe_active_scope_context)
+        .map(|scope| retire_constraints(&scope, releases_no_tools, releases_file_edits))
+        .filter(|scope| !scope.trim().is_empty())
     else {
         return latest_prompt.to_string();
     };
@@ -380,6 +389,9 @@ fn latest_prompt_releases_no_tools(prompt: &str) -> bool {
             if descriptive_wrapper_text(&normalized) {
                 return false;
             }
+            if explicit_constraint_cancellation(&normalized, TOOL_CONSTRAINT_SUBJECTS) {
+                return true;
+            }
             if explicit_tool_use_constraint(&normalized) {
                 return false;
             }
@@ -392,8 +404,13 @@ fn latest_prompt_releases_file_edits(prompt: &str) -> bool {
         .split(|ch: char| ch == '.' || ch == '!' || ch == '?' || ch == '\n')
         .any(|segment| {
             let normalized = segment.to_ascii_lowercase();
-            !descriptive_wrapper_text(&normalized)
-                && !explicit_no_edit_constraint(&normalized)
+            if descriptive_wrapper_text(&normalized) {
+                return false;
+            }
+            if explicit_constraint_cancellation(&normalized, EDIT_CONSTRAINT_SUBJECTS) {
+                return true;
+            }
+            !explicit_no_edit_constraint(&normalized)
                 && !read_only_constraint_requested(&normalized)
                 && positive_authorization(
                     &normalized,
@@ -401,12 +418,63 @@ fn latest_prompt_releases_file_edits(prompt: &str) -> bool {
                         "file edits are allowed",
                         "you may edit files",
                         "please edit files",
+                        "continue with shell and file edits",
+                        "continue with tools and file edits",
                         "continue with file edits",
                         "continue editing files",
+                        "use tools and edit files",
+                        "use shell and edit files",
                         "edit files",
                     ],
                 )
         })
+}
+
+const TOOL_CONSTRAINT_SUBJECTS: &[&str] = &[
+    "no tools",
+    "no-tools",
+    "tool restriction",
+    "tool constraint",
+    "do not run tools",
+    "do not use tools",
+];
+
+const EDIT_CONSTRAINT_SUBJECTS: &[&str] = &[
+    "no edits",
+    "no-edit",
+    "edit restriction",
+    "edit constraint",
+    "read-only constraint",
+    "read only constraint",
+    "read-only boundary",
+    "read only boundary",
+    "do not edit files",
+];
+
+fn explicit_constraint_cancellation(segment: &str, subjects: &[&str]) -> bool {
+    let normalized = segment.trim().to_ascii_lowercase();
+    subjects.iter().any(|subject| normalized.contains(subject))
+        && ([
+            " is lifted",
+            " are lifted",
+            " has been lifted",
+            " have been lifted",
+            " is removed",
+            " are removed",
+            " has been removed",
+            " have been removed",
+            " is cancelled",
+            " is canceled",
+            " no longer applies",
+            " no longer apply",
+            " is no longer required",
+            " are no longer required",
+        ]
+        .iter()
+        .any(|signal| normalized.contains(signal))
+            || ["remove ", "drop ", "cancel ", "lift "]
+                .iter()
+                .any(|signal| normalized.starts_with(signal)))
 }
 
 fn positive_tool_authorization(segment: &str) -> bool {
@@ -522,46 +590,29 @@ fn sanitize_scope_line(
         .trim_start_matches(['-', '*', '`'])
         .trim()
         .trim_matches(|ch: char| ch.is_whitespace() || ".,:;!?`".contains(ch));
-    if matches!(
-        fragment,
-        "do not run tools"
-            | "do not run tools or edit files"
-            | "don't run tools"
-            | "don't run tools or edit files"
-            | "never run tools"
-            | "never run tools or edit files"
-            | "must not run tools"
-            | "mustn't run tools"
-            | "do not use tools"
-            | "don't use tools"
-            | "never use tools"
-            | "do not use shell"
-            | "don't use shell"
-            | "never use shell"
-    ) && preserve_no_tools
-        || fragment == "reply with text only" && preserve_reply
-        || fragment == "no preamble" && preserve_preamble
-        || fragment == "no preamble about being codex" && preserve_preamble
+    let standalone_tool_constraint = EXPLICIT_TOOL_USE_CONSTRAINT_PHRASES.iter().any(|phrase| {
+        fragment == *phrase || fragment.strip_prefix(phrase) == Some(" or edit files")
+    });
+    if standalone_tool_constraint {
+        if preserve_no_tools && preserve_no_edits {
+            return Some(line.to_string());
+        }
+        if preserve_no_tools {
+            return Some(normalize_no_tools_wrapper(line));
+        }
+        if preserve_no_edits && fragment.ends_with("edit files") {
+            return Some(retire_constraints(line, true, false));
+        }
+        return None;
+    }
+    if fragment == "reply with text only" && preserve_reply
+        || matches!(fragment, "no preamble" | "no preamble about being codex") && preserve_preamble
     {
         return Some(line.to_string());
     }
     if matches!(
         fragment,
         "critical"
-            | "do not run tools"
-            | "do not run tools or edit files"
-            | "don't run tools"
-            | "don't run tools or edit files"
-            | "never run tools"
-            | "never run tools or edit files"
-            | "must not run tools"
-            | "mustn't run tools"
-            | "do not use tools"
-            | "don't use tools"
-            | "never use tools"
-            | "do not use shell"
-            | "don't use shell"
-            | "never use shell"
             | "reply with text only"
             | "no preamble"
             | "no preamble about being codex"
@@ -669,10 +720,10 @@ fn sanitize_scope_line(
             }
         } else {
             clean = remove_case_insensitive(&clean, "critical:");
-            if preserve_no_tools && !preserve_reply {
+            if preserve_no_tools && !preserve_no_edits {
                 clean = normalize_no_tools_wrapper(&clean);
             } else if !preserve_no_tools && preserve_no_edits {
-                clean = retire_tool_use_constraints(&clean, false);
+                clean = retire_constraints(&clean, true, false);
             } else if !preserve_no_tools {
                 clean = remove_no_tools_constraints(&clean);
             }
@@ -718,11 +769,21 @@ fn normalize_no_tools_wrapper(input: &str) -> String {
     for phrase in [
         "do not run tools or edit files",
         "don't run tools or edit files",
+        "cannot run tools or edit files",
         "can't run tools or edit files",
         "can't run tools",
+        "may not run tools or edit files",
         "never run tools or edit files",
         "must not run tools or edit files",
         "mustn't run tools or edit files",
+        "do not use tools or edit files",
+        "don't use tools or edit files",
+        "cannot use tools or edit files",
+        "can't use tools or edit files",
+        "may not use tools or edit files",
+        "never use tools or edit files",
+        "must not use tools or edit files",
+        "mustn't use tools or edit files",
     ] {
         output = replace_case_insensitive(&output, phrase, "Do not run tools");
     }
@@ -811,6 +872,13 @@ fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
     if matches!(kind, "no_tools" | "no_edits") && descriptive_constraint_prefix(&normalized) {
         return false;
     }
+    if (kind == "no_tools"
+        && explicit_constraint_cancellation(&normalized, TOOL_CONSTRAINT_SUBJECTS))
+        || (kind == "no_edits"
+            && explicit_constraint_cancellation(&normalized, EDIT_CONSTRAINT_SUBJECTS))
+    {
+        return false;
+    }
     for prefix in [
         "the user explicitly requires:",
         "user explicitly requires:",
@@ -833,25 +901,40 @@ fn user_constraint_segment_supports(segment: &str, kind: &str) -> bool {
                 && !normalized.contains("tools are allowed")
                 && !normalized.contains("tools may be used")
                 && !normalized.contains("not required")
-                || (read_only_constraint_requested(normalized)
-                    && !latest_prompt_releases_no_tools(normalized)
-                    && (normalized.starts_with("this is a read-only")
-                        || normalized.starts_with("this is read-only")
-                        || normalized.starts_with("keep this read-only")
-                        || normalized.starts_with("remain read-only")))
         }
         "no_edits" => {
-            explicit_no_edit_constraint(normalized)
-                || (read_only_constraint_requested(normalized)
-                    && (normalized.starts_with("this is a read-only")
-                        || normalized.starts_with("this is read-only")
-                        || normalized.starts_with("keep this read-only")
-                        || normalized.starts_with("remain read-only")))
+            explicit_no_edit_constraint(normalized) || imperative_read_only_constraint(normalized)
         }
         "reply" => normalized.contains("reply with text only"),
         "preamble" => normalized.contains("no preamble about being codex"),
         _ => false,
     }
+}
+
+fn imperative_read_only_constraint(text: &str) -> bool {
+    read_only_constraint_requested(text)
+        && [
+            "this is a read-only",
+            "this is a read only",
+            "this is read-only",
+            "this is read only",
+            "keep this read-only",
+            "keep this read only",
+            "remain read-only",
+            "remain read only",
+            "for this read-only",
+            "for this read only",
+            "during this read-only",
+            "during this read only",
+            "while this is read-only",
+            "while this is read only",
+            "please keep this read-only",
+            "please keep this read only",
+            "read-only ",
+            "read only ",
+        ]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
 }
 
 fn descriptive_constraint_prefix(text: &str) -> bool {
@@ -938,6 +1021,7 @@ fn explicit_no_edit_constraint(text: &str) -> bool {
     EXPLICIT_NO_EDIT_CONSTRAINT_PHRASES
         .iter()
         .any(|phrase| text.contains(phrase))
+        || explicit_tool_use_constraint(text) && text.contains("or edit files")
 }
 
 fn explicit_no_tools_constraint(text: &str) -> bool {
@@ -984,6 +1068,8 @@ fn read_only_constraint_requested(text: &str) -> bool {
         &[
             "read-only review",
             "read only review",
+            "read-only audit",
+            "read only audit",
             "read-only task",
             "read only task",
             "read-only constraint",
@@ -1000,6 +1086,7 @@ fn read_only_constraint_requested(text: &str) -> bool {
             "not a read only",
             "not a read-only task",
             "not a read-only review",
+            "not a read-only audit",
             "not a read-only boundary",
             "not read-only",
             "not read only",
@@ -1104,10 +1191,23 @@ fn normalize_wrapper_whitespace(input: &str) -> String {
     for phrase in [
         "can't run tools or edit files",
         "can't run tools",
+        "cannot run tools or edit files",
         "don't run tools or edit files",
         "don't run tools",
         "do not run tools or edit files",
         "do not run tools",
+        "may not run tools or edit files",
+        "must not run tools or edit files",
+        "mustn't run tools or edit files",
+        "never run tools or edit files",
+        "cannot use tools or edit files",
+        "can't use tools or edit files",
+        "don't use tools or edit files",
+        "do not use tools or edit files",
+        "may not use tools or edit files",
+        "must not use tools or edit files",
+        "mustn't use tools or edit files",
+        "never use tools or edit files",
         "reply with text only",
         "no preamble about being codex",
         "scope-extraction response",
@@ -1287,8 +1387,14 @@ fn scope_response_is_wrapper(input: &str, user_prompt: Option<&str>) -> bool {
         && user_prompt.is_some_and(|prompt| {
             let normalized_prompt = normalize_wrapper_whitespace(prompt).to_ascii_lowercase();
             let normalized_input = normalize_wrapper_whitespace(input).to_ascii_lowercase();
-            normalized_prompt.contains(&normalized_input)
-                && !descriptive_wrapper_text(&normalized_prompt)
+            let requirement = normalized_input
+                .trim()
+                .trim_start_matches(['-', '*', '>', '`'])
+                .trim();
+            normalized_prompt.lines().any(|line| {
+                let line = line.trim().trim_start_matches(['-', '*', '>', '`']).trim();
+                line.contains(requirement) && !descriptive_wrapper_text(line)
+            })
         })
     {
         return false;
@@ -1302,7 +1408,7 @@ fn scope_response_is_wrapper(input: &str, user_prompt: Option<&str>) -> bool {
         "summarize the active scope" | "summarize active scope"
     );
     if prefix.is_empty() {
-        suffix.starts_with("keep editing ")
+        summary || suffix.starts_with("keep editing ")
     } else {
         summary
             && prefix
@@ -2439,7 +2545,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
-    fn active_scope_constraint_survives_a_silent_latest_prompt() {
+    fn active_scope_constraints_survive_a_silent_latest_prompt() {
         let previous = "- Do not run tools. Keep this read-only review.";
         let active_prompt = active_scope_prompt(Some(previous), "Continue the review.");
         let extracted =
@@ -2448,7 +2554,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
         let clean = sanitize_scope_requirements(extracted, Some(&active_prompt));
 
         assert!(clean.contains("Do not run tools"));
-        assert!(!clean.contains("edit files"));
+        assert!(clean.contains("edit files"));
         assert!(!clean.contains("Reply with text only"));
     }
 
@@ -2680,6 +2786,33 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn file_edit_release_retires_no_edit_constraint_independently() {
+        let prompts = vec![
+            "Fix SMS-005. Do not edit files.".to_string(),
+            "File edits are allowed now; continue SMS-005.".to_string(),
+        ];
+        let active = active_user_prompt_context(&prompts, &prompts[1]);
+
+        assert!(active.contains("Fix SMS-005"));
+        assert!(!active.contains("Do not edit files"));
+    }
+
+    #[test]
+    fn explicit_no_tools_subtraction_retires_constraint() {
+        let prompts = vec![
+            "Fix SMS-005. Do not run tools.".to_string(),
+            "The previous no tools constraint is lifted; continue SMS-005.".to_string(),
+        ];
+        let active = active_user_prompt_context(&prompts, &prompts[1]);
+        let poisoned = "- Fix SMS-005. Do not run tools or edit files. Reply with text only.";
+        let clean = sanitize_scope_requirements(poisoned, Some(&active));
+
+        assert!(active.contains("Fix SMS-005"));
+        assert!(!clean.contains("Do not run tools"));
+        assert!(!clean.contains("edit files"));
+    }
+
+    #[test]
     fn incidental_unrelated_text_does_not_replace_active_scope() {
         let fallback = fallback_scope_with_user_prompts(
             "The command emitted an unrelated warning; continue fixing SMS-005.",
@@ -2801,7 +2934,7 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 
         let clean = sanitize_scope_requirements(wrapped, Some(prompt));
 
-        assert_eq!(clean, "- Do not run tools.");
+        assert_eq!(clean, "- Do not edit files.");
     }
 
     #[test]
@@ -2811,17 +2944,17 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 
         let clean = sanitize_scope_requirements(wrapped, Some(prompt));
 
-        assert_eq!(clean, "- Do not run tools.");
+        assert_eq!(clean, "- Do not edit files.");
     }
 
     #[test]
-    fn read_only_context_removes_edit_restriction_before_split_reply() {
+    fn read_only_context_preserves_only_edit_restriction_before_split_reply() {
         let wrapped = "- Do not run tools or edit files. Reply with text\nonly. No preamble about being Codex.";
         let prompt = "This is a read-only review; preserve that constraint.";
 
         let clean = sanitize_scope_requirements(wrapped, Some(prompt));
 
-        assert_eq!(clean, "- Do not run tools.");
+        assert_eq!(clean, "- Do not edit files.");
     }
 
     #[test]
@@ -2831,7 +2964,18 @@ edit files. Reply with text only. No preamble about being Codex.\n\
 
         assert_eq!(
             sanitize_scope_requirements(wrapped, Some(prompt)),
-            "- Do not run tools."
+            "- Do not edit files."
+        );
+    }
+
+    #[test]
+    fn pure_read_only_scope_does_not_create_no_tools_constraint() {
+        let wrapped = "- Do not run tools or edit files. Reply with text only.";
+        let prompt = "This is a read-only review.";
+
+        assert_eq!(
+            sanitize_scope_requirements(wrapped, Some(prompt)),
+            "- Do not edit files."
         );
     }
 
@@ -2907,6 +3051,20 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
+    fn standalone_combined_wrapper_keeps_only_supported_constraint() {
+        let poisoned = "- Do not run tools or edit files.";
+
+        assert_eq!(
+            sanitize_scope_requirements(poisoned, Some("Do not run tools.")),
+            "- Do not run tools."
+        );
+        assert_eq!(
+            sanitize_scope_requirements(poisoned, Some("This is a read-only review.")),
+            "- Do not edit files."
+        );
+    }
+
+    #[test]
     fn genuine_scope_response_requirement_is_untouched() {
         let requirement = "- Preserve the scope-extraction response verbatim for the audit.";
 
@@ -2944,13 +3102,22 @@ edit files. Reply with text only. No preamble about being Codex.\n\
     }
 
     #[test]
-    fn scope_response_active_requirement_is_untouched_without_prompt_context() {
-        for requirement in [
-            "Scope-extraction response: preserve the extracted scope verbatim for the audit.",
-            "Scope-extraction response: summarize active scope.",
-        ] {
-            assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
-        }
+    fn scope_response_audit_requirement_is_untouched_without_prompt_context() {
+        let requirement =
+            "Scope-extraction response: preserve the extracted scope verbatim for the audit.";
+
+        assert_eq!(sanitize_scope_requirements(requirement, None), requirement);
+    }
+
+    #[test]
+    fn internal_scope_response_summary_requires_user_provenance() {
+        let requirement = "Scope-extraction response: summarize active scope.";
+
+        assert_eq!(sanitize_scope_requirements(requirement, None), "");
+        assert_eq!(
+            sanitize_scope_requirements(requirement, Some(requirement)),
+            requirement
+        );
     }
 
     #[test]
