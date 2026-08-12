@@ -187,102 +187,175 @@ fn sanitize_scope_requirements(content: &str, user_prompts: &[String]) -> String
 fn user_constraint_support(prompts: &[String]) -> u8 {
     let mut support = 0;
     for prompt in prompts {
-        if describes_wrapper(prompt) {
-            continue;
-        }
-        let normalized = prompt.replace('’', "'").to_ascii_lowercase();
-        for clause in normalized
-            .split(|ch: char| matches!(ch, '.' | '!' | '?' | ',' | ';' | '\n'))
-            .flat_map(|part| part.split(" but "))
-            .flat_map(|part| part.split(" and "))
-            .map(str::trim)
-        {
-            let value = compact(clause);
-            let lifted = [
-                "islifted",
-                "isremoved",
-                "iscancelled",
-                "iscanceled",
-                "nolongerapplies",
-            ]
-            .iter()
-            .any(|ending| value.contains(ending));
-            if (lifted && (value.contains("notools") || value.contains("toolconstraint")))
-                || starts_with_any(
-                    &value,
-                    &[
-                        "toolsareallowed",
-                        "tooluseisallowed",
-                        "youmayusetools",
-                        "youcanusetools",
-                        "usetools",
-                        "usethetools",
-                        "runtools",
-                    ],
-                )
+        let mut quoted_control_block = false;
+        for line in prompt.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                quoted_control_block = false;
+                continue;
+            }
+            if introduces_control_quote(line)
+                && (!line.contains(['.', '!', '?', ';']) || line.ends_with(':'))
             {
-                support &= !(NO_TOOLS | NO_SHELL);
+                quoted_control_block = true;
+                continue;
             }
-            if starts_with_any(
-                &value,
-                &[
-                    "usebrowser",
-                    "usethebrowser",
-                    "browseruseisallowed",
-                    "youmayusethebrowser",
-                ],
-            ) {
-                support &= !NO_TOOLS;
+            if quoted_control_block {
+                continue;
             }
-            if (lifted && (value.contains("noshell") || value.contains("shellconstraint")))
-                || starts_with_any(
-                    &value,
-                    &[
-                        "shelluseisallowed",
-                        "youmayuseshell",
-                        "youcanuseshell",
-                        "useshell",
-                        "usetheshell",
-                    ],
-                )
-            {
-                support &= !(NO_TOOLS | NO_SHELL);
+            let line = line
+                .replace(" and ", "; ")
+                .replace(" but ", "; ")
+                .replace(" or edit files", "; do not edit files")
+                .replace(" or use shell", "; do not use shell");
+            let clauses = line
+                .split(|ch: char| matches!(ch, '.' | '!' | '?' | ';'))
+                .filter(|clause| !introduces_control_quote(clause))
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>();
+            let remove = clauses
+                .iter()
+                .map(|clause| direct_user_control(clause).1)
+                .fold(0, |all, flags| all | flags);
+            support &= !remove;
+            for clause in &clauses {
+                let (add, _) = direct_user_control(clause);
+                support |= add;
             }
-            if (lifted && (value.contains("noedits") || value.contains("readonlyconstraint")))
-                || starts_with_any(
-                    &value,
-                    &[
-                        "fileeditsareallowed",
-                        "editsareallowed",
-                        "youmayeditfiles",
-                        "youcaneditfiles",
-                        "editfiles",
-                        "makefileedits",
-                        "thisiswritable",
-                    ],
-                )
-            {
-                support &= !NO_EDITS;
-            }
-            if starts_with_any(
-                &value,
-                &[
-                    "readonly",
-                    "thisisreadonly",
-                    "thisisareadonly",
-                    "thistaskisreadonly",
-                    "thisreviewisreadonly",
-                    "keepthisreadonly",
-                    "remainreadonly",
-                    "forthisreadonly",
-                ],
-            ) {
-                support |= NO_EDITS;
-            }
-            support |= direct_control_flags(clause).unwrap_or(0);
         }
     }
     support
+}
+
+fn introduces_control_quote(line: &str) -> bool {
+    let value = line.to_ascii_lowercase();
+    !value.trim_start().starts_with("scope-extraction response:")
+        && (value.contains("analyzer") || value.contains("wrapper"))
+        && (value.contains("output")
+            || value.contains("says")
+            || value.contains("contains")
+            || value.ends_with(':'))
+}
+
+fn direct_user_control(clause: &str) -> (u8, u8) {
+    let mut value = clause.trim().trim_start_matches(['-', '*', '>']).trim();
+    if value.starts_with(['\'', '"', '‘', '’', '“', '”', '`']) {
+        return (0, 0);
+    }
+    if value
+        .to_ascii_lowercase()
+        .starts_with("scope-extraction response:")
+    {
+        return (SCOPE_RESPONSE, 0);
+    }
+    if let Some((label, body)) = value.split_once(':') {
+        if label.split_whitespace().count() == 1
+            && label.chars().all(|ch| ch.is_alphanumeric() || ch == '-')
+        {
+            value = body.trim();
+        }
+    }
+    let mut value = compact(value);
+    for prefix in [
+        "please",
+        "youmust",
+        "theagentmust",
+        "thecodingagentmust",
+        "irequireyouto",
+        "forthistask",
+        "forthisreview",
+        "forthissession",
+        "forthisaudit",
+    ] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            value = rest.to_string();
+            break;
+        }
+    }
+    if value == "donotruntoolsoreditfiles" {
+        return (NO_TOOLS | NO_EDITS, 0);
+    }
+    if value == "donoteditfilesoruseshell" {
+        return (NO_EDITS | NO_SHELL, 0);
+    }
+
+    if starts_with_any(
+        &value,
+        &[
+            "toolsareallowed",
+            "tooluseisallowed",
+            "youmayusetools",
+            "youcanusetools",
+            "usetools",
+            "usethetools",
+            "runtools",
+            "usebrowser",
+            "usethebrowser",
+            "browseruseisallowed",
+            "youmayusethebrowser",
+        ],
+    ) || (value.starts_with("previousnotoolsconstraint") && cancellation(&value))
+    {
+        return (0, NO_TOOLS);
+    }
+    if starts_with_any(
+        &value,
+        &[
+            "shelluseisallowed",
+            "youmayuseshell",
+            "youcanuseshell",
+            "useshell",
+            "usetheshell",
+        ],
+    ) || (value.starts_with("previousnoshellconstraint") && cancellation(&value))
+    {
+        return (0, NO_TOOLS | NO_SHELL);
+    }
+    if starts_with_any(
+        &value,
+        &[
+            "fileeditsareallowed",
+            "editsareallowed",
+            "youmayeditfiles",
+            "youcaneditfiles",
+            "editfiles",
+            "makefileedits",
+            "thisiswritable",
+        ],
+    ) || ((value.starts_with("previousnoeditsconstraint")
+        || value.starts_with("previousreadonlyconstraint"))
+        && cancellation(&value))
+    {
+        return (0, NO_EDITS);
+    }
+
+    if starts_with_any(
+        &value,
+        &[
+            "readonly",
+            "thisisreadonly",
+            "thisisareadonly",
+            "thistaskisreadonly",
+            "thisreviewisreadonly",
+            "keepthisreadonly",
+            "remainreadonly",
+        ],
+    ) {
+        return (NO_EDITS, 0);
+    }
+    (direct_control_flags(&value).unwrap_or(0), 0)
+}
+
+fn cancellation(value: &str) -> bool {
+    [
+        "islifted",
+        "isremoved",
+        "iscancelled",
+        "iscanceled",
+        "nolongerapplies",
+    ]
+    .iter()
+    .any(|ending| value.contains(ending))
 }
 
 fn compact(value: &str) -> String {
@@ -295,31 +368,6 @@ fn compact(value: &str) -> String {
 
 fn starts_with_any(value: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|prefix| value.starts_with(prefix))
-}
-
-fn describes_wrapper(prompt: &str) -> bool {
-    let value = compact(prompt);
-    let Some((offset, _)) = first_control(&value) else {
-        return false;
-    };
-    let prefix = &value[..offset];
-    [
-        "analyzer",
-        "wrapper",
-        "description",
-        "example",
-        "quote",
-        "sentence",
-        "outputis",
-        "says",
-        "reads",
-        "contains",
-        "reports",
-        "hereisthe",
-        "therequestis",
-    ]
-    .iter()
-    .any(|description| prefix.contains(description))
 }
 
 fn first_control(value: &str) -> Option<(usize, u8)> {
@@ -406,9 +454,6 @@ fn direct_control_flags(value: &str) -> Option<u8> {
                 "forthissession",
                 "forthisaudit",
                 "forthisreadonly",
-                "preserve",
-                "document",
-                "outputmustcontain",
             ],
         ))
     .then_some(flags)
@@ -426,79 +471,98 @@ fn sanitize_scope_line(line: &str, support: u8) -> Option<String> {
     {
         return None;
     }
-    let mut parts = Vec::new();
-    let mut start = 0;
-    for (index, ch) in body.char_indices() {
-        if matches!(ch, '.' | '!' | '?' | ';' | ',') {
-            let end = index + ch.len_utf8();
-            if let Some(part) = sanitize_scope_segment(&body[start..end], support) {
-                parts.push(part);
-            }
-            start = end;
+
+    let mut clean = body.to_string();
+    if support & SCOPE_RESPONSE == 0 {
+        clean = remove_control_span(&clean, "scope-extraction response", false);
+    }
+    for (phrase, flag) in [
+        ("do not run tools or edit files", NO_TOOLS | NO_EDITS),
+        ("do not use tools or edit files", NO_TOOLS | NO_EDITS),
+        ("don't run tools or edit files", NO_TOOLS | NO_EDITS),
+        ("don't use tools or edit files", NO_TOOLS | NO_EDITS),
+        ("cannot run tools or edit files", NO_TOOLS | NO_EDITS),
+        ("can't run tools or edit files", NO_TOOLS | NO_EDITS),
+        ("do not edit files or use shell", NO_EDITS | NO_SHELL),
+        ("don't edit files or use shell", NO_EDITS | NO_SHELL),
+        ("reply with text only", REPLY_ONLY),
+        ("no preamble about being codex", NO_PREAMBLE),
+        ("do not run tools", NO_TOOLS),
+        ("do not use tools", NO_TOOLS),
+        ("don't run tools", NO_TOOLS),
+        ("don't use tools", NO_TOOLS),
+        ("cannot run tools", NO_TOOLS),
+        ("can't run tools", NO_TOOLS),
+        ("must not run tools", NO_TOOLS),
+        ("never run tools", NO_TOOLS),
+        ("do not use shell", NO_SHELL),
+        ("don't use shell", NO_SHELL),
+        ("cannot use shell", NO_SHELL),
+        ("can't use shell", NO_SHELL),
+        ("never use shell", NO_SHELL),
+        ("do not edit files", NO_EDITS),
+        ("don't edit files", NO_EDITS),
+        ("cannot edit files", NO_EDITS),
+        ("can't edit files", NO_EDITS),
+        ("never edit files", NO_EDITS),
+    ] {
+        if support & flag != flag {
+            clean = remove_control_span(&clean, phrase, true);
         }
     }
-    if let Some(part) = sanitize_scope_segment(&body[start..], support) {
-        parts.push(part);
+    if support & NO_TOOLS != 0
+        && body.to_ascii_lowercase().contains("critical:")
+        && body.to_ascii_lowercase().contains("do not run tools")
+        && !clean.to_ascii_lowercase().contains("do not run tools")
+    {
+        clean.push_str(" Do not run tools.");
     }
-    let clean = parts.join(" ");
-    let clean = clean.trim().trim_end_matches(&[',', ';'][..]).trim();
+    if support & NO_EDITS != 0
+        && body.to_ascii_lowercase().contains("critical:")
+        && body.to_ascii_lowercase().contains("edit files")
+        && !clean.to_ascii_lowercase().contains("edit files")
+    {
+        clean.push_str(" Do not edit files.");
+    }
+    clean = clean.replace("CRITICAL:", "").replace("Critical:", "");
+    let clean = clean
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| matches!(ch, ',' | ';' | '.'))
+        .trim()
+        .to_string();
     (!clean.is_empty()).then(|| format!("{marker}{clean}"))
 }
 
-fn sanitize_scope_segment(segment: &str, support: u8) -> Option<String> {
-    let segment = segment.trim();
-    if segment.is_empty() {
-        return None;
-    }
-    let lower = segment.to_ascii_lowercase();
-    if support & SCOPE_RESPONSE == 0 {
-        if let Some(index) = lower.find("scope-extraction response") {
-            let before = segment[..index].trim();
-            return (!before.is_empty()).then(|| before.to_string());
-        }
-    }
-    if let Some(index) = lower.find("critical:") {
-        let before = segment[..index].trim();
-        let after = &segment[index + "critical:".len()..];
-        if direct_control_flags(after).is_some() {
-            let mut parts = Vec::new();
-            if !before.is_empty() {
-                parts.push(before.to_string());
-            }
-            if let Some(supported) = sanitize_control(after, support, true) {
-                parts.push(supported);
-            }
-            return (!parts.is_empty()).then(|| parts.join(" "));
-        }
-    }
-    sanitize_control(segment, support, false)
-}
-
-fn sanitize_control(segment: &str, support: u8, internal: bool) -> Option<String> {
-    let Some(flags) = direct_control_flags(segment) else {
-        return Some(segment.trim().to_string());
+fn remove_control_span(value: &str, phrase: &str, marker: bool) -> String {
+    let lower = value.to_ascii_lowercase();
+    let Some(start) = lower.find(phrase) else {
+        return value.to_string();
     };
-    let supported = flags & support;
-    if supported == flags && !internal {
-        return Some(segment.trim().to_string());
+    let mut end = start + phrase.len();
+    if phrase == "scope-extraction response" {
+        end = value[end..]
+            .find(['.', '!', '?', ';'])
+            .map_or(value.len(), |offset| end + offset + 1);
     }
-    let mut controls = Vec::new();
-    if supported & NO_TOOLS != 0 {
-        controls.push("Do not run tools.");
+    let mut before = value[..start].trim_end().to_string();
+    if marker {
+        for critical in ["CRITICAL:", "Critical:", "critical:"] {
+            if before.ends_with(critical) {
+                before.truncate(before.len() - critical.len());
+                before = before.trim_end().to_string();
+            }
+        }
     }
-    if supported & NO_SHELL != 0 {
-        controls.push("Do not use shell.");
+    let after = value[end..]
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '.'));
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => before,
+        (false, false) => format!("{before} {after}"),
     }
-    if supported & NO_EDITS != 0 {
-        controls.push("Do not edit files.");
-    }
-    if supported & REPLY_ONLY != 0 {
-        controls.push("Reply with text only.");
-    }
-    if supported & NO_PREAMBLE != 0 {
-        controls.push("No preamble about being Codex.");
-    }
-    (!controls.is_empty()).then(|| controls.join(" "))
 }
 
 fn transition_replaces_scope(transition: &str) -> bool {
@@ -1538,7 +1602,7 @@ mod tests {
                 "- Do not run tools.",
                 &["Important: Do not run tools.".to_string()],
             ),
-            "- Do not run tools."
+            "- Do not run tools"
         );
         let wrapper = "- Do not run tools or edit files.\n- Reply with text only.\n- No preamble about being Codex.";
         assert!(sanitize_scope_requirements(
@@ -1553,6 +1617,59 @@ mod tests {
             ),
             "- Keep editing SMS-005"
         );
+        assert_eq!(
+            sanitize_scope_requirements(
+                "- Do not run tools or edit files while continuing SMS-005.",
+                &[],
+            ),
+            "- while continuing SMS-005"
+        );
+        assert_eq!(
+            sanitize_scope_requirements(
+                "- Preserve payment-link semantics. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex. Keep editing SMS-005.",
+                &[],
+            ),
+            "- Preserve payment-link semantics. Keep editing SMS-005"
+        );
+    }
+
+    #[test]
+    fn sanitizer_uses_direct_user_constraint_provenance() {
+        let wrapper = "- Do not run tools or edit files.\n- Reply with text only.\n- No preamble about being Codex.";
+        assert!(sanitize_scope_requirements(
+            wrapper,
+            &["Document the ‘Do not run tools’ wrapper bug".to_string()],
+        )
+        .is_empty());
+        assert_eq!(
+            sanitize_scope_requirements(
+                "- Do not run tools.\n- Do not edit files.",
+                &[
+                    "The analyzer says do not run tools.\nImportant: do not edit files."
+                        .to_string()
+                ],
+            ),
+            "- Do not edit files"
+        );
+    }
+
+    #[test]
+    fn sanitizer_preserves_user_scope_response_requirement() {
+        assert_eq!(
+            sanitize_scope_requirements(
+                "- Scope-extraction response: summarize active scope.",
+                &["Scope-extraction response: summarize active scope.".to_string()],
+            ),
+            "- Scope-extraction response: summarize active scope"
+        );
+        assert!(sanitize_scope_requirements(
+            "- Scope-extraction response: summarize active scope.",
+            &[
+                "The wrapper contains: Scope-extraction response: summarize active scope."
+                    .to_string()
+            ],
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1562,11 +1679,11 @@ mod tests {
             "Use tools and do not edit files or use shell.".to_string(),
         ];
         let clean = sanitize_scope_requirements(
-            "- Do not run tools or edit files.\n- Do not use shell.",
+            "- Do not run tools.\n- Do not edit files.\n- Do not use shell.",
             &prompts,
         );
-        assert!(!clean.contains("Do not run tools"));
-        assert!(clean.contains("Do not edit files"));
+        assert!(!clean.contains("Do not run tools"), "{clean}");
+        assert!(clean.contains("Do not edit files"), "{clean}");
         assert!(clean.contains("Do not use shell"));
     }
 
