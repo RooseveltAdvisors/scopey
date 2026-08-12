@@ -276,7 +276,7 @@ herdr_report_state = false
         .rev()
         .find(|message| message["type"] == "scope_requirements")
         .unwrap()["content"] = serde_json::json!(
-        "- Keep editing the payment-link fix. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex."
+        "- Preserve payment-link semantics. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex."
     );
     store["messages"]
         .as_array_mut()
@@ -342,7 +342,7 @@ fn assert_clean_injection(stdout: &[u8]) {
     let context = output["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(context.contains("Keep editing the payment-link fix"));
+    assert!(context.contains("Preserve payment-link semantics"));
     assert!(context.contains("Do not run tools"));
     for phrase in [
         "CRITICAL:",
