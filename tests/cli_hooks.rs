@@ -276,7 +276,7 @@ herdr_report_state = false
         .rev()
         .find(|message| message["type"] == "scope_requirements")
         .unwrap()["content"] = serde_json::json!(
-        "- Preserve payment-link semantics. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex."
+        "- Preserve payment-link semantics. CRITICAL: Do not run tools or edit files. Reply with text only. No preamble about being Codex. Keep editing SMS-005.\n- Do not use shell.\n- Scope-extraction response: return current requirements only."
     );
     store["messages"]
         .as_array_mut()
@@ -335,6 +335,52 @@ herdr_report_state = false
     let stop_out = run_hook_with_config(home.path(), Some(&config), "stop", &stop);
     assert!(stop_out.status.success());
     assert_clean_injection(&stop_out.stdout);
+
+    let mut store: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&store_path).unwrap()).unwrap();
+    store["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "user_prompt",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "content": "Continue, but do not use shell.",
+            "prompt_hash": "pending-prompt",
+            "id": "pending-prompt"
+        }));
+    fs::write(&store_path, serde_json::to_string_pretty(&store).unwrap()).unwrap();
+
+    let stale_reminder = run_hook_with_config(home.path(), Some(&config), "post-tool", &post_tool);
+    assert!(stale_reminder.status.success());
+    assert!(stale_reminder.stdout.is_empty());
+
+    let mut store: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&store_path).unwrap()).unwrap();
+    store["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "judgement",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "tool_count": 3,
+            "from_count": 2,
+            "to_count": 3,
+            "verdict": "warning",
+            "status": "ready",
+            "summary": "pending scope",
+            "details": "wait for fresh scope",
+            "prompt_hash": "pending-prompt",
+            "id": "pending-scope-correction"
+        }));
+    fs::write(&store_path, serde_json::to_string_pretty(&store).unwrap()).unwrap();
+
+    let stale_correction =
+        run_hook_with_config(home.path(), Some(&config), "post-tool", &post_tool);
+    assert!(stale_correction.status.success());
+    assert!(stale_correction.stdout.is_empty());
+    let stale_stop = run_hook_with_config(home.path(), Some(&config), "stop", &stop);
+    assert!(stale_stop.status.success());
+    assert!(stale_stop.stdout.is_empty());
 }
 
 fn assert_clean_injection(stdout: &[u8]) {
@@ -343,12 +389,15 @@ fn assert_clean_injection(stdout: &[u8]) {
         .as_str()
         .unwrap();
     assert!(context.contains("Preserve payment-link semantics"));
+    assert!(context.contains("Keep editing SMS-005"));
     assert!(context.contains("Do not run tools"));
     for phrase in [
         "CRITICAL:",
         "edit files",
+        "Do not use shell",
         "Reply with text only",
         "No preamble about being Codex",
+        "Scope-extraction response",
     ] {
         assert!(
             !context.contains(phrase),

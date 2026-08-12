@@ -659,7 +659,6 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
     }
     let count = store.data.tool_call_count;
     let delta = meaningful_delta;
-    let latest_user_prompt = store.all_user_prompts().last().cloned();
 
     let n = cfg.n_tool_calls.max(1);
     let m = cfg.m_reminder.max(1);
@@ -682,9 +681,12 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
 
     // 1) Apply ready off-track/warning judgement (lags previous window ≈ 2N)
     if let Some(j) = store.ready_judgement_for_injection().cloned() {
-        let scope =
-            sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
-                .unwrap_or_else(|| "(scope requirements not ready yet)".into());
+        let Some(scope) = sanitized_scope_requirements_for_injection(&store) else {
+            store.persist()?;
+            drop(store);
+            let _ = drain_pending_jobs(cfg, &sid, &cwd);
+            return Ok(());
+        };
         let summary = j.summary.clone().unwrap_or_default();
         let details = j.details.clone().unwrap_or_default();
         let verdict = j
@@ -719,9 +721,7 @@ pub fn post_tool(cfg: &Config) -> Result<()> {
 
     // 2) Periodic scope reminder
     if !injected && count > 0 && count % m == 0 && store.data.last_reminder_at_count != count {
-        if let Some(scope) =
-            sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
-        {
+        if let Some(scope) = sanitized_scope_requirements_for_injection(&store) {
             let text = build_reminder_injection_from_sanitized_scope(&scope);
             store.append(SessionMessage::injection("reminder", &text, count));
             store.data.last_reminder_at_count = count;
@@ -845,7 +845,6 @@ pub fn stop(cfg: &Config) -> Result<()> {
     }
 
     let count = store.data.tool_call_count;
-    let latest_user_prompt = store.all_user_prompts().last().cloned();
     let max_lag = if cfg.judgement_max_lag_tools == 0 {
         cfg.n_tool_calls.saturating_mul(2).max(30)
     } else {
@@ -854,9 +853,12 @@ pub fn stop(cfg: &Config) -> Result<()> {
     let _ = store.expire_stale_judgements(count, max_lag);
 
     if let Some(j) = store.ready_judgement_for_injection().cloned() {
-        let scope =
-            sanitized_scope_requirements_for_injection(&store, latest_user_prompt.as_deref())
-                .unwrap_or_else(|| "(scope requirements not ready yet)".into());
+        let Some(scope) = sanitized_scope_requirements_for_injection(&store) else {
+            store.persist()?;
+            drop(store);
+            let _ = drain_pending_jobs(cfg, &sid, &cwd);
+            return Ok(());
+        };
         let summary = j.summary.clone().unwrap_or_default();
         let details = j.details.clone().unwrap_or_default();
         let verdict = j
