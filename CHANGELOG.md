@@ -7,6 +7,23 @@ and the project intends to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-12
+
+### Added
+
+- `scopey disable` and `scopey enable` persist an `enabled` config flag so
+  Scopey can be paused without uninstalling hooks or deleting session data.
+  Disabled hooks return immediately without recording events or spawning work.
+
+## [0.2.1] - 2026-08-11
+
+### Fixed
+
+- Course corrections now preserve completed work instead of directing the
+  coding agent to undo it. The agent summarizes the flagged out-of-scope work,
+  explains its current state and proposed next step, then waits for explicit
+  permission before continuing or reverting anything.
+
 ## [0.2.0] - 2026-08-05
 
 ### Added

@@ -205,6 +205,17 @@ background jobs, while `scopey setup --force` refreshes installed hooks.
 `scopey uninstall` removes hooks but keeps local data; add `--purge-data` to
 remove Scopey's config, sessions, logs, and locks as well.
 
+Temporarily pause Scopey without removing hooks or data:
+
+```bash
+scopey disable
+scopey enable
+```
+
+These commands persist `enabled = false|true` in the effective config file.
+While disabled, installed hooks still run but immediately return as no-ops:
+they do not read events, record tools, spawn model jobs, or inject messages.
+
 ## Herdr awareness
 
 [Herdr](https://herdr.dev) is an agent multiplexer with its own notification + state API.
@@ -261,14 +272,18 @@ unaffected active requirements; explicit removals, contradictions, and
 replacements win. Questions add an answering obligation without becoming new
 implementation authorization or an inferred no-edit prohibition.
 Machine-generated task notifications are treated as context, not new user
-goals. Each transition is written to the structured
-session log as `job.summarize.transition`, including the operation and
-before/after scope hashes. The scope-analysis prompt directs the model not to
-invent planning-only, no-tool, no-edit, or similar permission boundaries. Judge
-windows are bound to one user-prompt epoch; a new prompt invalidates pending
-verdicts and restarts the tool window so old work is never judged against a
-newer scope. If the summarizer model is unavailable, the fallback preserves
-only the latest request instead of replaying the full prompt history.
+goals. Scopey-origin hook events are also treated as generated context at the
+user-prompt boundary and are not persisted as user requirements; the
+structured event source distinguishes them from genuine user prompts, so
+explicit user-authored no-tool or read-only constraints remain intact. Each
+transition is written to the structured session log as
+`job.summarize.transition`, including the operation and before/after scope
+hashes. The scope-analysis prompt directs the model not to invent planning-only,
+no-tool, no-edit, or similar permission boundaries. Judge windows are bound to
+one user-prompt epoch; a new prompt invalidates pending verdicts and restarts
+the tool window so old work is never judged against a newer scope. If the
+summarizer model is unavailable, the fallback preserves only the latest
+request instead of replaying the full prompt history.
 
 ### Development checks
 
@@ -296,6 +311,7 @@ legacy files at `work/<escaped-cwd>/<session_id>.json` are migrated into
 
 | Key | Default | Meaning |
 |-----|---------|---------|
+| `enabled` | `true` | Master switch; `false` makes installed hooks no-op |
 | `n_tool_calls` | 10 | Journal + start background judge every N tools |
 | `m_reminder` | 20 | Inject scope reminder every M tools |
 | `model_runner` | `auto` | Session harness, or pin any supported runner |

@@ -302,20 +302,9 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Internal prompt fingerprints that must never be stored as user prompts.
-pub fn looks_like_scopey_internal_prompt(prompt: &str) -> bool {
-    let p = prompt.trim_start();
-    p.starts_with("You are a scope analyst")
-        || p.starts_with("You are a strict scope auditor")
-        || p.contains("SCOPE REQUIREMENTS checklist")
-        || p.contains("[scopey COURSE CORRECTION")
-        || p.contains("[scopey SCOPE REMINDER")
-        || std::env::var(ENV_INTERNAL).is_ok()
-}
-
-/// Kill leaked scopey background workers and orphaned claude -p/codex from storms.
-/// Conservative: only matches known scopey log patterns / SCOPEY_INTERNAL children is hard;
-/// we kill processes whose command line is `scopey summarize|judge` or claude -p with scope prompts.
+/// Kill leaked scopey background workers from storms.
+/// Conservative: only matches known scopey log patterns;
+/// we kill processes whose command line is `scopey summarize|judge`.
 pub fn purge_leaked_jobs() -> Result<usize> {
     #[cfg(unix)]
     {
@@ -334,26 +323,6 @@ pub fn purge_leaked_jobs() -> Result<usize> {
                                 let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
                                 killed += 1;
                             }
-                        }
-                    }
-                }
-            }
-        }
-        // recursive storm: claude -p with our analyst prompt
-        let out2 = std::process::Command::new("pgrep")
-            .args(["-fl", "claude"])
-            .output();
-        if let Ok(o) = out2 {
-            let text = String::from_utf8_lossy(&o.stdout);
-            for line in text.lines() {
-                if line.contains("scope analyst")
-                    || line.contains("strict scope auditor")
-                    || line.contains("SCOPE REQUIREMENTS checklist")
-                {
-                    if let Some(pid_s) = line.split_whitespace().next() {
-                        if let Ok(pid) = pid_s.parse::<i32>() {
-                            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
-                            killed += 1;
                         }
                     }
                 }
@@ -386,24 +355,6 @@ pub fn purge_leaked_jobs() -> Result<usize> {
 mod tests {
     use super::*;
     use crate::config::Config;
-
-    #[test]
-    fn internal_prompt_detect() {
-        assert!(looks_like_scopey_internal_prompt(
-            "You are a scope analyst for a coding agent session."
-        ));
-        assert!(looks_like_scopey_internal_prompt(
-            "You are a strict scope auditor for a coding agent."
-        ));
-        assert!(looks_like_scopey_internal_prompt(
-            "  You are a scope analyst ..."
-        ));
-        assert!(looks_like_scopey_internal_prompt(
-            "x\nSCOPE REQUIREMENTS checklist\n"
-        ));
-        assert!(!looks_like_scopey_internal_prompt("fix the login bug"));
-        assert!(!looks_like_scopey_internal_prompt("refactor billing"));
-    }
 
     #[test]
     fn env_truthy_variants() {

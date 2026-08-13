@@ -173,6 +173,12 @@ enum Commands {
         no_kill_jobs: bool,
     },
 
+    /// Keep hooks installed but make every hook invocation a no-op
+    Disable,
+
+    /// Re-enable processing by installed hooks
+    Enable,
+
     /// Show whether scopey is installed and runnable
     #[command(long_about = DOCTOR_ABOUT)]
     Doctor,
@@ -665,7 +671,6 @@ Examples:
 const PURGE_ABOUT: &str = r#"SIGTERM leaked background workers that can storm the machine:
 
   - `scopey summarize` / `scopey judge` processes
-  - `claude -p` processes whose prompt is a scopey internal analyst/judge text
   - stale per-session job lock files
 
 Safe to run any time hooks feel stuck or CPU spikes from recursive headless Claude.
@@ -782,6 +787,22 @@ fn run() -> Result<()> {
             };
             let do_kill = kill_jobs && !no_kill_jobs;
             hooks::setup::run_uninstall(&cfg, set, purge_data, do_kill)
+        }
+        Commands::Disable => {
+            let path = cfg.write_enabled(false)?;
+            println!(
+                "scopey disabled; hooks remain installed and will no-op ({})",
+                path.display()
+            );
+            Ok(())
+        }
+        Commands::Enable => {
+            let path = cfg.write_enabled(true)?;
+            println!(
+                "scopey enabled; installed hooks are active ({})",
+                path.display()
+            );
+            Ok(())
         }
         Commands::Doctor => hooks::setup::run_doctor(&cfg),
         Commands::Config { init, json } => {
