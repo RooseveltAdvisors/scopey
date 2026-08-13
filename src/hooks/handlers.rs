@@ -433,13 +433,13 @@ pub fn user_prompt(cfg: &Config) -> Result<()> {
         eventlog::debug(&sid, "hook.user_prompt", "empty prompt; no-op", json!({}));
         return Ok(());
     }
-    // Never store recursive headless prompts as user scope.
-    if guard::looks_like_scopey_internal_prompt(&prompt) {
+    // A Scopey-origin event is generated context, not a user requirement.
+    if ev.source.as_deref() == Some("scopey") {
         eventlog::warn(
             &sid,
             "hook.user_prompt",
-            "ignored internal scopey/model prompt",
-            json!({ "chars": prompt.len() }),
+            "ignored Scopey-origin prompt",
+            json!({ "source": ev.source }),
         );
         return Ok(());
     }

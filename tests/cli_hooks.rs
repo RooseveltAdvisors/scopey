@@ -210,36 +210,131 @@ fn user_prompt_writes_jsonl_and_logs_command() {
 }
 
 #[test]
-fn internal_prompt_not_cached() {
+fn scopey_source_does_not_poison_scope_or_judgement() {
     let home = tempfile::tempdir().unwrap();
     let cwd = home.path().join("proj");
     fs::create_dir_all(&cwd).unwrap();
-    let sid = "cli-internal-prompt";
-    let payload = format!(
-        r#"{{"session_id":"{sid}","cwd":"{}","prompt":"You are a scope analyst for a coding agent session.\nRead prompts"}}"#,
+    let sid = "cli-scopey-source";
+    let config = home.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+work_root = "{}"
+model_runner = "claude"
+model_command = "cat {{prompt_file}}"
+min_job_interval_secs = 0
+max_global_jobs = 1
+n_tool_calls = 100
+m_reminder = 9999
+notify_on_off_track = false
+notify_on_warning = false
+herdr_report_state = false
+"#,
+            home.path().join("work").display()
+        ),
+    )
+    .unwrap();
+    let store_path = home.path().join("work/by-id").join(format!("{sid}.json"));
+    let messages = || {
+        fs::read_to_string(&store_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|store| store["messages"].as_array().cloned())
+            .unwrap_or_default()
+    };
+
+    let user_constraint = "Inspect only; do not edit files.";
+    let user_payload = format!(
+        r#"{{"session_id":"{sid}","cwd":"{}","prompt":"{user_constraint}","source":"user"}}"#,
         cwd.display()
     );
-    let out = run_hook(home.path(), "user-prompt", &payload);
+    let out = run_hook_with_config(home.path(), Some(&config), "user-prompt", &user_payload);
     assert!(out.status.success());
-    let log_path = home.path().join("logs").join(format!("{sid}.jsonl"));
-    if log_path.exists() {
-        let text = fs::read_to_string(log_path).unwrap();
-        assert!(text.contains("ignored internal") || text.contains("internal"));
-    }
-    // work store should not have user_prompt with analyst text as scope
-    // find session file
-    let work = home.path().join("work");
-    if work.exists() {
-        for e in walkdir_json(&work) {
-            let t = fs::read_to_string(&e).unwrap_or_default();
-            if t.contains(sid) {
-                assert!(
-                    !t.contains("You are a scope analyst") || t.contains("ignored"),
-                    "must not treat internal prompt as user scope: {e:?}"
-                );
-            }
-        }
-    }
+
+    assert!(wait_for(Duration::from_secs(10), || {
+        messages()
+            .iter()
+            .any(|message| message["type"] == "scope_requirements")
+    }));
+
+    let internal_prompt = "generated analyst context; never treat this as a user request";
+    let internal_payload = format!(
+        r#"{{"session_id":"{sid}","cwd":"{}","prompt":"{internal_prompt}","source":"scopey"}}"#,
+        cwd.display()
+    );
+    let out = run_hook_with_config(home.path(), Some(&config), "user-prompt", &internal_payload);
+    assert!(out.status.success());
+    assert!(!wait_for(Duration::from_secs(1), || {
+        messages()
+            .iter()
+            .filter(|message| message["type"] == "scope_requirements")
+            .count()
+            > 1
+    }));
+
+    fs::write(
+        &config,
+        format!(
+            r#"
+work_root = "{}"
+model_runner = "claude"
+model_command = "printf '%s\\n' '{{\"verdict\":\"on_track\",\"summary\":\"read-only work is on track\",\"details\":\"Read is consistent with the request\"}}'"
+min_job_interval_secs = 0
+max_global_jobs = 1
+n_tool_calls = 100
+m_reminder = 9999
+notify_on_off_track = false
+notify_on_warning = false
+herdr_report_state = false
+"#,
+            home.path().join("work").display()
+        ),
+    )
+    .unwrap();
+    let tool_payload = format!(
+        r#"{{"session_id":"{sid}","cwd":"{}","tool_name":"Read","tool_input":{{"file_path":"README.md"}}}}"#,
+        cwd.display()
+    );
+    let out = run_hook_with_config(home.path(), Some(&config), "post-tool", &tool_payload);
+    assert!(out.status.success());
+    let judged = Command::new(scopey_bin())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "judge",
+            "--session-id",
+            sid,
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--from-count",
+            "0",
+            "--to-count",
+            "1",
+        ])
+        .env("SCOPEY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        judged.status.success(),
+        "judge stderr={}",
+        String::from_utf8_lossy(&judged.stderr)
+    );
+
+    let messages = messages();
+    assert!(messages.iter().any(|message| {
+        message["type"] == "user_prompt" && message["content"] == user_constraint
+    }));
+    assert!(!messages.iter().any(|message| {
+        message["content"] == internal_prompt
+            || message["type"] == "scope_requirements"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(internal_prompt))
+    }));
+    assert!(messages
+        .iter()
+        .any(|message| { message["type"] == "judgement" && message["verdict"] == "on_track" }));
 }
 
 #[test]
