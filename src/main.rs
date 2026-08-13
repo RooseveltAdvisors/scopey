@@ -671,7 +671,6 @@ Examples:
 const PURGE_ABOUT: &str = r#"SIGTERM leaked background workers that can storm the machine:
 
   - `scopey summarize` / `scopey judge` processes
-  - `claude -p` processes whose prompt is a scopey internal analyst/judge text
   - stale per-session job lock files
 
 Safe to run any time hooks feel stuck or CPU spikes from recursive headless Claude.

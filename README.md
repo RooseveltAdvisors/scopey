@@ -272,14 +272,18 @@ unaffected active requirements; explicit removals, contradictions, and
 replacements win. Questions add an answering obligation without becoming new
 implementation authorization or an inferred no-edit prohibition.
 Machine-generated task notifications are treated as context, not new user
-goals. Each transition is written to the structured
-session log as `job.summarize.transition`, including the operation and
-before/after scope hashes. The scope-analysis prompt directs the model not to
-invent planning-only, no-tool, no-edit, or similar permission boundaries. Judge
-windows are bound to one user-prompt epoch; a new prompt invalidates pending
-verdicts and restarts the tool window so old work is never judged against a
-newer scope. If the summarizer model is unavailable, the fallback preserves
-only the latest request instead of replaying the full prompt history.
+goals. Scopey-origin hook events are also treated as generated context at the
+user-prompt boundary and are not persisted as user requirements; the
+structured event source distinguishes them from genuine user prompts, so
+explicit user-authored no-tool or read-only constraints remain intact. Each
+transition is written to the structured session log as
+`job.summarize.transition`, including the operation and before/after scope
+hashes. The scope-analysis prompt directs the model not to invent planning-only,
+no-tool, no-edit, or similar permission boundaries. Judge windows are bound to
+one user-prompt epoch; a new prompt invalidates pending verdicts and restarts
+the tool window so old work is never judged against a newer scope. If the
+summarizer model is unavailable, the fallback preserves only the latest
+request instead of replaying the full prompt history.
 
 ### Development checks
 
