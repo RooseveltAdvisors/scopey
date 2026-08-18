@@ -1,6 +1,7 @@
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -187,7 +188,12 @@ fn which_any(names: &[&str]) -> bool {
 
 /// Run the configured cheap model with a prompt; return the completion text
 /// plus provider-reported usage where the runner exposes it.
-pub fn complete(cfg: &Config, prompt: &str, session_harness: &str) -> Result<Completion> {
+pub fn complete(
+    cfg: &Config,
+    prompt: &str,
+    session_harness: &str,
+    cwd: &Path,
+) -> Result<Completion> {
     let choice = resolve_choice(cfg, session_harness)?;
     eprintln!("scopey model: {}", choice.reason);
 
@@ -216,7 +222,7 @@ pub fn complete(cfg: &Config, prompt: &str, session_harness: &str) -> Result<Com
         // Custom commands may invoke an OAuth-authenticated Claude CLI. Keep
         // recursion guards, but do not force Claude's API-key-only SIMPLE mode.
         crate::guard::apply_hook_disable_env(&mut cmd);
-        let output = run_with_timeout(cmd, cfg.model_timeout_secs, "model_command")?;
+        let output = run_with_timeout(cmd, cfg.model_timeout_secs, "model_command", cwd)?;
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -237,15 +243,15 @@ pub fn complete(cfg: &Config, prompt: &str, session_harness: &str) -> Result<Com
 
     match choice.runner {
         Runner::Claude => {
-            complete_claude(cfg, prompt, &choice.model).map(|(text, usage)| done(text, usage))
+            complete_claude(cfg, prompt, &choice.model, cwd).map(|(text, usage)| done(text, usage))
         }
         Runner::Codex => {
-            complete_codex(cfg, prompt, &choice.model).map(|(text, usage)| done(text, usage))
+            complete_codex(cfg, prompt, &choice.model, cwd).map(|(text, usage)| done(text, usage))
         }
-        Runner::Grok => complete_grok(cfg, prompt, &choice.model).map(|text| done(text, None)),
-        Runner::Pi => complete_pi(cfg, prompt, &choice.model).map(|text| done(text, None)),
+        Runner::Grok => complete_grok(cfg, prompt, &choice.model, cwd).map(|text| done(text, None)),
+        Runner::Pi => complete_pi(cfg, prompt, &choice.model, cwd).map(|text| done(text, None)),
         Runner::OpenCode => {
-            complete_opencode(cfg, prompt, &choice.model).map(|text| done(text, None))
+            complete_opencode(cfg, prompt, &choice.model, cwd).map(|text| done(text, None))
         }
     }
 }
@@ -254,6 +260,7 @@ fn complete_claude(
     cfg: &Config,
     prompt: &str,
     model: &str,
+    cwd: &Path,
 ) -> Result<(String, Option<ModelUsage>)> {
     use crate::guard;
 
@@ -277,7 +284,7 @@ fn complete_claude(
     guard::apply_hook_disable_env(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "claude")
+    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "claude", cwd)
         .with_context(|| format!("claude -p --model {model} [{}]", claude_env_diagnostics()))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -373,7 +380,12 @@ fn clip_model_error(text: &str) -> String {
     }
 }
 
-fn complete_codex(cfg: &Config, prompt: &str, model: &str) -> Result<(String, Option<ModelUsage>)> {
+fn complete_codex(
+    cfg: &Config,
+    prompt: &str,
+    model: &str,
+    cwd: &Path,
+) -> Result<(String, Option<ModelUsage>)> {
     let out_file = NamedTempFile::new().context("codex out file")?;
     let out_path = out_file.path().to_path_buf();
 
@@ -401,7 +413,7 @@ fn complete_codex(cfg: &Config, prompt: &str, model: &str) -> Result<(String, Op
         .stderr(Stdio::piped());
     guard::apply_internal_env(&mut cmd);
 
-    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "codex")?;
+    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "codex", cwd)?;
     let stdout = if output.status.success() {
         output.stdout
     } else {
@@ -418,7 +430,7 @@ fn complete_codex(cfg: &Config, prompt: &str, model: &str) -> Result<(String, Op
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         guard::apply_internal_env(&mut cmd2);
-        let output2 = run_with_timeout(cmd2, cfg.model_timeout_secs, "codex")?;
+        let output2 = run_with_timeout(cmd2, cfg.model_timeout_secs, "codex", cwd)?;
         if !output2.status.success() {
             bail!(
                 "codex exec -m {model} failed: {}",
@@ -492,7 +504,7 @@ fn parse_codex_exec_message(stdout: &str) -> Option<String> {
     message
 }
 
-fn complete_grok(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
+fn complete_grok(cfg: &Config, prompt: &str, model: &str, cwd: &Path) -> Result<String> {
     use crate::guard;
     // Grok Build: `grok -p` / `--single` headless print mode.
     let mut cmd = Command::new("grok");
@@ -504,7 +516,7 @@ fn complete_grok(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     guard::apply_internal_env(&mut cmd);
-    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "grok")?;
+    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "grok", cwd)?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
@@ -517,7 +529,7 @@ fn complete_grok(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     guard::apply_internal_env(&mut cmd2);
-    let output2 = run_with_timeout(cmd2, cfg.model_timeout_secs, "grok")?;
+    let output2 = run_with_timeout(cmd2, cfg.model_timeout_secs, "grok", cwd)?;
     if !output2.status.success() {
         bail!(
             "grok -p/--single failed: {}",
@@ -527,7 +539,7 @@ fn complete_grok(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output2.stdout).trim().to_string())
 }
 
-fn complete_pi(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
+fn complete_pi(cfg: &Config, prompt: &str, model: &str, cwd: &Path) -> Result<String> {
     use crate::guard;
     // pi -p / --print non-interactive; --no-session avoids polluting history.
     let mut cmd = Command::new("pi");
@@ -542,7 +554,7 @@ fn complete_pi(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     guard::apply_internal_env(&mut cmd);
-    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "pi")?;
+    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "pi", cwd)?;
     if !output.status.success() {
         bail!(
             "pi --print failed: {}",
@@ -552,7 +564,7 @@ fn complete_pi(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn complete_opencode(cfg: &Config, prompt: &str, model: &str) -> Result<String> {
+fn complete_opencode(cfg: &Config, prompt: &str, model: &str, cwd: &Path) -> Result<String> {
     use crate::guard;
     // opencode run [message..]
     let mut cmd = Command::new("opencode");
@@ -565,7 +577,7 @@ fn complete_opencode(cfg: &Config, prompt: &str, model: &str) -> Result<String> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     guard::apply_internal_env(&mut cmd);
-    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "opencode")?;
+    let output = run_with_timeout(cmd, cfg.model_timeout_secs, "opencode", cwd)?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
@@ -576,7 +588,7 @@ fn complete_opencode(cfg: &Config, prompt: &str, model: &str) -> Result<String> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     guard::apply_internal_env(&mut cmd2);
-    let output2 = run_with_timeout(cmd2, cfg.model_timeout_secs, "opencode")?;
+    let output2 = run_with_timeout(cmd2, cfg.model_timeout_secs, "opencode", cwd)?;
     if !output2.status.success() {
         bail!(
             "opencode run failed: {}",
@@ -590,7 +602,9 @@ fn run_with_timeout(
     mut cmd: Command,
     timeout_secs: u64,
     name: &str,
+    cwd: &Path,
 ) -> Result<std::process::Output> {
+    cmd.current_dir(crate::guard::safe_child_cwd(cwd));
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let name_owned = name.to_string();
@@ -643,6 +657,7 @@ pub fn report_models(cfg: &Config, verify: bool) -> Result<()> {
     }
 
     println!("\nVerifying with probe prompt…");
+    let cwd = std::env::current_dir()?;
     let mut failed = 0;
     let mut seen = std::collections::HashSet::new();
     for harness in ["claude", "codex", "grok", "pi", "opencode"] {
@@ -666,7 +681,12 @@ pub fn report_models(cfg: &Config, verify: bool) -> Result<()> {
             }
         );
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        match complete(cfg, "Reply with exactly the single word: pong", harness) {
+        match complete(
+            cfg,
+            "Reply with exactly the single word: pong",
+            harness,
+            &cwd,
+        ) {
             Ok(completion) => {
                 let text = completion.text;
                 let preview: String = text.chars().take(80).collect();
@@ -857,7 +877,7 @@ mod tests {
                 ),
                 ..Config::default()
             };
-            let result = complete(&cfg, "ignored", "claude");
+            let result = complete(&cfg, "ignored", "claude", Path::new("."));
 
             match previous {
                 Some(value) => std::env::set_var("CLAUDE_CODE_SIMPLE", value),
@@ -865,6 +885,93 @@ mod tests {
             }
 
             assert_eq!(result.unwrap().text, "pong");
+        });
+    }
+
+    #[test]
+    fn model_command_drops_firstmate_identity_and_uses_session_cwd() {
+        Config::with_temp_scopey_home(|_| {
+            let cwd = tempfile::tempdir().unwrap();
+            let previous = [
+                ("FM_HOME", std::env::var_os("FM_HOME")),
+                ("PI_CODING_AGENT", std::env::var_os("PI_CODING_AGENT")),
+                ("CLAUDECODE", std::env::var_os("CLAUDECODE")),
+            ];
+            std::env::set_var("FM_HOME", "/opt/ra/firstmate");
+            std::env::set_var("PI_CODING_AGENT", "true");
+            std::env::set_var("CLAUDECODE", "1");
+
+            let cfg = Config {
+                model_runner: "codex".into(),
+                model: "gpt-test".into(),
+                model_command: Some(
+                    "printf '%s|%s|%s|%s' \"$PWD\" \"${FM_HOME-unset}\" \
+                     \"${PI_CODING_AGENT-unset}\" \"${CLAUDECODE-unset}\""
+                        .into(),
+                ),
+                ..Config::default()
+            };
+            let result = complete(&cfg, "ignored", "codex", cwd.path());
+
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            assert_eq!(
+                result.unwrap().text,
+                format!("{}|unset|unset|unset", cwd.path().display())
+            );
+        });
+    }
+
+    #[test]
+    fn model_command_leaves_firstmate_tree_for_child_cwd() {
+        Config::with_temp_scopey_home(|_| {
+            let previous = [
+                ("FM_HOME", std::env::var_os("FM_HOME")),
+                ("PI_CODING_AGENT", std::env::var_os("PI_CODING_AGENT")),
+            ];
+            std::env::set_var("FM_HOME", "/opt/ra/firstmate");
+            std::env::set_var("PI_CODING_AGENT", "true");
+
+            let cfg = Config {
+                model_runner: "codex".into(),
+                model: "gpt-test".into(),
+                model_command: Some(
+                    "printf '%s|%s|%s' \"$PWD\" \"${FM_HOME-unset}\" \
+                     \"${PI_CODING_AGENT-unset}\""
+                        .into(),
+                ),
+                ..Config::default()
+            };
+            let result = complete(
+                &cfg,
+                "ignored",
+                "codex",
+                Path::new("/opt/ra/firstmate/projects/scopey"),
+            );
+
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            let text = result.unwrap().text;
+            let mut parts = text.split('|');
+            let child_cwd = parts.next().expect("cwd");
+            assert_eq!(parts.next(), Some("unset"));
+            assert_eq!(parts.next(), Some("unset"));
+            let child = Path::new(child_cwd);
+            assert_eq!(child, std::env::temp_dir().as_path());
+            assert!(
+                !child.starts_with("/opt/ra/firstmate"),
+                "model child stayed in Firstmate tree: {child_cwd}"
+            );
         });
     }
 
@@ -916,7 +1023,7 @@ mod tests {
             ..Config::default()
         };
 
-        let error = complete(&cfg, "ignored", "claude").unwrap_err();
+        let error = complete(&cfg, "ignored", "claude", Path::new(".")).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("status=exit status: 7"), "{message}");
         assert!(message.contains("stdout=auth-error"), "{message}");

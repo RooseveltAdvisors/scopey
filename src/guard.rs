@@ -24,6 +24,16 @@ pub const ENV_INTERNAL: &str = "SCOPEY_INTERNAL";
 /// Alias accepted for the same guard.
 pub const ENV_HOOKS_DISABLED: &str = "SCOPEY_HOOKS_DISABLED";
 
+const FIRSTMATE_ENV_PREFIXES: [&str; 2] = ["FM_", "FIRSTMATE_"];
+const FIRSTMATE_ENV_MARKERS: [&str; 5] = [
+    "PI_CODING_AGENT",
+    "CLAUDECODE",
+    "GROK_AGENT",
+    "CURSOR_AGENT",
+    "CURSOR_INVOKED_AS",
+];
+const FIRSTMATE_ROOT: &str = "/opt/ra/firstmate";
+
 /// True when this process must not run hook side-effects (model children, nested scopey).
 pub fn is_internal() -> bool {
     env_truthy(ENV_INTERNAL) || env_truthy(ENV_HOOKS_DISABLED)
@@ -41,18 +51,50 @@ fn env_truthy(key: &str) -> bool {
 
 /// Disable scopey re-entry (and Claude Code hooks) without breaking OAuth.
 ///
+/// Also applies [`apply_firstmate_isolation_env`] so spawned work is not
+/// identified as a Firstmate session.
+///
 /// Prefer this for `claude -p` children: setting `CLAUDE_CODE_SIMPLE=1` forces
 /// API-key-only auth and prints "Not logged in" with exit 0 when the user is
 /// only OAuth-authenticated — which is the common Claude Code desktop case.
 pub fn apply_hook_disable_env(cmd: &mut std::process::Command) {
     cmd.env(ENV_INTERNAL, "1");
     cmd.env(ENV_HOOKS_DISABLED, "1");
+    apply_firstmate_isolation_env(cmd);
     // A parent Scopey worker may itself have inherited SIMPLE. Merely avoiding
     // setting it again is not enough: Claude Code treats any inherited value
     // as API-key-only mode and skips OAuth/keychain credentials.
     cmd.env_remove("CLAUDE_CODE_SIMPLE");
     // Defensive: some Claude wrappers honor this without disabling OAuth.
     cmd.env("CLAUDE_CODE_DISABLE_HOOKS", "1");
+}
+
+/// Prevent spawned Scopey work from being identified as a Firstmate session
+/// so a summarize/judge helper cannot take the Firstmate session lock.
+pub fn apply_firstmate_isolation_env(cmd: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if FIRSTMATE_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    for key in FIRSTMATE_ENV_MARKERS {
+        cmd.env_remove(key);
+    }
+}
+
+/// Keep summarize/judge helpers and model workers out of the live Firstmate
+/// checkout. Paths under that tree fall back to the process temp directory.
+pub fn safe_child_cwd(cwd: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if resolved == Path::new(FIRSTMATE_ROOT) || resolved.starts_with(Path::new(FIRSTMATE_ROOT)) {
+        std::env::temp_dir()
+    } else {
+        cwd.to_path_buf()
+    }
 }
 
 /// Apply storm-prevention env to a Command before spawn.
@@ -454,6 +496,71 @@ mod tests {
         Config::with_temp_scopey_home(|_| {
             let cfg = Config::default();
             assert!(SessionJobGuard::can_spawn(&cfg, "never-seen").unwrap());
+        });
+    }
+
+    #[test]
+    fn safe_child_cwd_keeps_ordinary_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(safe_child_cwd(dir.path()), dir.path());
+    }
+
+    #[test]
+    fn safe_child_cwd_leaves_firstmate_tree() {
+        let temp = std::env::temp_dir();
+        assert_eq!(safe_child_cwd(Path::new(FIRSTMATE_ROOT)), temp);
+        assert_eq!(
+            safe_child_cwd(Path::new("/opt/ra/firstmate/projects/scopey")),
+            temp
+        );
+    }
+
+    #[test]
+    fn spawned_child_does_not_see_firstmate_identity() {
+        Config::with_temp_scopey_home(|_| {
+            let previous = [
+                ("FM_HOME", std::env::var_os("FM_HOME")),
+                ("FM_PI_HARNESS", std::env::var_os("FM_PI_HARNESS")),
+                ("FIRSTMATE_X", std::env::var_os("FIRSTMATE_X")),
+                ("PI_CODING_AGENT", std::env::var_os("PI_CODING_AGENT")),
+                ("CLAUDECODE", std::env::var_os("CLAUDECODE")),
+                ("GROK_AGENT", std::env::var_os("GROK_AGENT")),
+                ("CURSOR_AGENT", std::env::var_os("CURSOR_AGENT")),
+                ("CURSOR_INVOKED_AS", std::env::var_os("CURSOR_INVOKED_AS")),
+            ];
+            std::env::set_var("FM_HOME", "/opt/ra/firstmate");
+            std::env::set_var("FM_PI_HARNESS", "pi");
+            std::env::set_var("FIRSTMATE_X", "1");
+            std::env::set_var("PI_CODING_AGENT", "true");
+            std::env::set_var("CLAUDECODE", "1");
+            std::env::set_var("GROK_AGENT", "1");
+            std::env::set_var("CURSOR_AGENT", "1");
+            std::env::set_var("CURSOR_INVOKED_AS", "cursor");
+
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args([
+                "-c",
+                "printf '%s|%s|%s|%s|%s|%s|%s|%s' \
+                 \"${FM_HOME-unset}\" \"${FM_PI_HARNESS-unset}\" \"${FIRSTMATE_X-unset}\" \
+                 \"${PI_CODING_AGENT-unset}\" \"${CLAUDECODE-unset}\" \
+                 \"${GROK_AGENT-unset}\" \"${CURSOR_AGENT-unset}\" \
+                 \"${CURSOR_INVOKED_AS-unset}\"",
+            ]);
+            apply_hook_disable_env(&mut cmd);
+            let output = cmd.output().expect("spawn isolated child");
+
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            assert!(output.status.success(), "stderr={:?}", output.stderr);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "unset|unset|unset|unset|unset|unset|unset|unset"
+            );
         });
     }
 }

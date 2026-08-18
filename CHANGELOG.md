@@ -7,6 +7,13 @@ and the project intends to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Background summarize and judge helpers now drop inherited Firstmate identity
+  markers and refuse `/opt/ra/firstmate` as their working directory, so those
+  jobs cannot take the Firstmate session lock. The configured `model_runner`
+  is unchanged.
+
 ## [0.2.2] - 2026-08-12
 
 ### Added
