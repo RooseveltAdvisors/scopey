@@ -9,8 +9,7 @@ use crate::tool_journal::{extract_tools_from_transcript, format_tools_for_judge}
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const SCOPE_CONTEXT_TURNS: usize = 4;
@@ -196,13 +195,11 @@ pub fn summarize_scope(
         cfg.summarize_prompt_chars,
     );
 
-    let mut completion: Option<model::Completion> = None;
-    let (transition, out) = match model::complete(cfg, &sys, &harness) {
+    let (transition, out, completion) = match model::complete(cfg, &sys, &harness, cwd) {
         Ok(c) => {
             crate::model_health::record_success(cfg, "summarize");
-            let parsed = extract_scope_transition(&c.text);
-            completion = Some(c);
-            parsed
+            let (transition, out) = extract_scope_transition(&c.text);
+            (transition, out, Some(c))
         }
         Err(e) => {
             crate::model_health::record_failure(cfg, "summarize", &format!("{e:#}"));
@@ -213,7 +210,11 @@ pub fn summarize_scope(
                 format!("model failed; using latest-prompt fallback: {e:#}"),
                 json!({ "harness": harness }),
             );
-            ("FALLBACK_LATEST".into(), fallback_scope(latest_prompt))
+            (
+                "FALLBACK_LATEST".into(),
+                fallback_scope(latest_prompt),
+                None,
+            )
         }
     };
     let hash = hash_prompt(&joined);
@@ -431,7 +432,7 @@ Respond with EXACTLY this JSON object (no markdown fences):
 "#
     );
 
-    let completion = match model::complete(cfg, &prompt, &harness) {
+    let completion = match model::complete(cfg, &prompt, &harness, cwd) {
         Ok(t) => {
             crate::model_health::record_success(cfg, "judge");
             t
@@ -731,7 +732,7 @@ pub fn transcript_len(path: Option<&Path>) -> Option<u64> {
 
 /// Returns `Ok(true)` if a child was spawned, `Ok(false)` if skipped (busy/cap).
 pub fn spawn_background_summarize(cfg: &Config, session_id: &str, cwd: &Path) -> Result<bool> {
-    spawn_background_job(cfg, session_id, "summarize", |cmd| {
+    spawn_background_job(cfg, session_id, cwd, "summarize", |cmd| {
         cmd.arg("summarize")
             .arg("--session-id")
             .arg(session_id)
@@ -750,7 +751,7 @@ pub fn spawn_background_judge(
     transcript_path: Option<&Path>,
 ) -> Result<bool> {
     let tp = transcript_path.map(|p| p.to_path_buf());
-    spawn_background_job(cfg, session_id, "judge", move |cmd| {
+    spawn_background_job(cfg, session_id, cwd, "judge", move |cmd| {
         cmd.arg("judge")
             .arg("--session-id")
             .arg(session_id)
@@ -766,7 +767,13 @@ pub fn spawn_background_judge(
     })
 }
 
-fn spawn_background_job<F>(cfg: &Config, session_id: &str, kind: &str, args: F) -> Result<bool>
+fn spawn_background_job<F>(
+    cfg: &Config,
+    session_id: &str,
+    cwd: &Path,
+    kind: &str,
+    args: F,
+) -> Result<bool>
 where
     F: FnOnce(&mut Command),
 {
@@ -806,6 +813,7 @@ where
 
     let mut cmd = Command::new(&bin);
     args(&mut cmd);
+    cmd.current_dir(guard::safe_child_cwd(cwd));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));

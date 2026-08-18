@@ -24,6 +24,16 @@ pub const ENV_INTERNAL: &str = "SCOPEY_INTERNAL";
 /// Alias accepted for the same guard.
 pub const ENV_HOOKS_DISABLED: &str = "SCOPEY_HOOKS_DISABLED";
 
+const FIRSTMATE_ENV_PREFIXES: [&str; 2] = ["FM_", "FIRSTMATE_"];
+const FIRSTMATE_ENV_MARKERS: [&str; 5] = [
+    "PI_CODING_AGENT",
+    "CLAUDECODE",
+    "GROK_AGENT",
+    "CURSOR_AGENT",
+    "CURSOR_INVOKED_AS",
+];
+const FIRSTMATE_ROOT: &str = "/opt/ra/firstmate";
+
 /// True when this process must not run hook side-effects (model children, nested scopey).
 pub fn is_internal() -> bool {
     env_truthy(ENV_INTERNAL) || env_truthy(ENV_HOOKS_DISABLED)
@@ -47,12 +57,39 @@ fn env_truthy(key: &str) -> bool {
 pub fn apply_hook_disable_env(cmd: &mut std::process::Command) {
     cmd.env(ENV_INTERNAL, "1");
     cmd.env(ENV_HOOKS_DISABLED, "1");
+    apply_firstmate_isolation_env(cmd);
     // A parent Scopey worker may itself have inherited SIMPLE. Merely avoiding
     // setting it again is not enough: Claude Code treats any inherited value
     // as API-key-only mode and skips OAuth/keychain credentials.
     cmd.env_remove("CLAUDE_CODE_SIMPLE");
     // Defensive: some Claude wrappers honor this without disabling OAuth.
     cmd.env("CLAUDE_CODE_DISABLE_HOOKS", "1");
+}
+
+/// Prevent spawned Scopey work from being identified as a Firstmate session.
+pub fn apply_firstmate_isolation_env(cmd: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if FIRSTMATE_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    for key in FIRSTMATE_ENV_MARKERS {
+        cmd.env_remove(key);
+    }
+}
+
+/// Keep model workers out of the live Firstmate checkout and its local hooks.
+pub fn safe_child_cwd(cwd: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if resolved == Path::new(FIRSTMATE_ROOT) || resolved.starts_with(Path::new(FIRSTMATE_ROOT)) {
+        std::env::temp_dir()
+    } else {
+        cwd.to_path_buf()
+    }
 }
 
 /// Apply storm-prevention env to a Command before spawn.
