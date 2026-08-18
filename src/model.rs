@@ -928,6 +928,54 @@ mod tests {
     }
 
     #[test]
+    fn model_command_leaves_firstmate_tree_for_child_cwd() {
+        Config::with_temp_scopey_home(|_| {
+            let previous = [
+                ("FM_HOME", std::env::var_os("FM_HOME")),
+                ("PI_CODING_AGENT", std::env::var_os("PI_CODING_AGENT")),
+            ];
+            std::env::set_var("FM_HOME", "/opt/ra/firstmate");
+            std::env::set_var("PI_CODING_AGENT", "true");
+
+            let cfg = Config {
+                model_runner: "codex".into(),
+                model: "gpt-test".into(),
+                model_command: Some(
+                    "printf '%s|%s|%s' \"$PWD\" \"${FM_HOME-unset}\" \
+                     \"${PI_CODING_AGENT-unset}\""
+                        .into(),
+                ),
+                ..Config::default()
+            };
+            let result = complete(
+                &cfg,
+                "ignored",
+                "codex",
+                Path::new("/opt/ra/firstmate/projects/scopey"),
+            );
+
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            let text = result.unwrap().text;
+            let mut parts = text.split('|');
+            let child_cwd = parts.next().expect("cwd");
+            assert_eq!(parts.next(), Some("unset"));
+            assert_eq!(parts.next(), Some("unset"));
+            let child = Path::new(child_cwd);
+            assert_eq!(child, std::env::temp_dir().as_path());
+            assert!(
+                !child.starts_with("/opt/ra/firstmate"),
+                "model child stayed in Firstmate tree: {child_cwd}"
+            );
+        });
+    }
+
+    #[test]
     fn claude_print_json_yields_text_and_usage() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":" pong ","session_id":"abc","usage":{"input_tokens":4,"cache_creation_input_tokens":6706,"cache_read_input_tokens":8875,"output_tokens":6}}"#;
         let (text, usage, is_error) = parse_claude_print_json(stdout);

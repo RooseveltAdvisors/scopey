@@ -1030,3 +1030,269 @@ herdr_report_state = false
     );
     assert_eq!(store["pending_judge"]["to_count"], 30);
 }
+
+fn parse_probe(text: &str) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn env_get(map: &std::collections::HashMap<String, String>, key: &str) -> String {
+    map.get(key).cloned().unwrap_or_else(|| "unset".into())
+}
+
+fn assert_isolated_probe(probe: &std::collections::HashMap<String, String>, kind: &str) {
+    for key in [
+        "child_FM_HOME",
+        "child_FM_PI_HARNESS",
+        "child_FIRSTMATE_X",
+        "child_PI_CODING_AGENT",
+        "child_CLAUDECODE",
+        "helper_FM_HOME",
+        "helper_PI_CODING_AGENT",
+        "helper_CLAUDECODE",
+    ] {
+        assert_eq!(
+            env_get(probe, key),
+            "unset",
+            "{kind} {key} leaked Firstmate identity: {probe:?}"
+        );
+    }
+    let child_cwd = env_get(probe, "child_cwd");
+    let helper_cwd = env_get(probe, "helper_cwd");
+    assert!(
+        !child_cwd.starts_with("/opt/ra/firstmate"),
+        "{kind} model child cwd stayed in Firstmate: {child_cwd}"
+    );
+    assert!(
+        !helper_cwd.starts_with("/opt/ra/firstmate"),
+        "{kind} helper cwd stayed in Firstmate: {helper_cwd}"
+    );
+    assert_eq!(
+        env_get(probe, "runner"),
+        "codex",
+        "{kind} left model_runner=codex"
+    );
+    assert_eq!(
+        env_get(probe, "args_has_exec"),
+        "yes",
+        "{kind} did not invoke codex exec"
+    );
+}
+
+/// Firstmate-hosted summarize/judge helpers must keep model_runner=codex,
+/// drop Firstmate identity, leave /opt/ra/firstmate, and never hold the
+/// Firstmate session lock.
+#[test]
+fn firstmate_helpers_stay_off_the_helm() {
+    let home = tempfile::tempdir().unwrap();
+    let fm_home = tempfile::tempdir().unwrap();
+    let probe_dir = tempfile::tempdir().unwrap();
+    let fake_bin = home.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let summarize_probe = probe_dir.path().join("summarize.env");
+    let judge_probe = probe_dir.path().join("judge.env");
+    let isolated_lock = fm_home.path().join("state/.lock");
+    let live_lock = PathBuf::from("/opt/ra/firstmate/state/.lock");
+    let live_lock_before = fs::read_to_string(&live_lock).ok();
+
+    let fake_codex = fake_bin.join("codex");
+    let script = r#"#!/bin/sh
+set -eu
+probe_dir='#PROBE_DIR#'
+kind=summarize
+for arg in "$@"; do
+  case "$arg" in
+    *verdict*) kind=judge ;;
+  esac
+done
+probe="$probe_dir/$kind.env"
+helper_cwd=$(readlink /proc/$PPID/cwd 2>/dev/null || printf missing)
+helper_env=$(tr '\0' '\n' < /proc/$PPID/environ 2>/dev/null || true)
+env_or_unset() {
+  key="$1"
+  val=$(printf '%s\n' "$helper_env" | sed -n "s/^${key}=//p" | head -n1)
+  if [ -n "$val" ]; then printf '%s' "$val"; else printf unset; fi
+}
+args_has_exec=no
+for arg in "$@"; do
+  if [ "$arg" = exec ]; then args_has_exec=yes; fi
+done
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then out="$arg"; fi
+  prev="$arg"
+done
+{
+  echo "kind=$kind"
+  echo "runner=codex"
+  echo "args_has_exec=$args_has_exec"
+  echo "child_cwd=$PWD"
+  echo "helper_cwd=$helper_cwd"
+  echo "child_pid=$$"
+  echo "helper_pid=$PPID"
+  echo "child_FM_HOME=${FM_HOME-unset}"
+  echo "child_FM_PI_HARNESS=${FM_PI_HARNESS-unset}"
+  echo "child_FIRSTMATE_X=${FIRSTMATE_X-unset}"
+  echo "child_PI_CODING_AGENT=${PI_CODING_AGENT-unset}"
+  echo "child_CLAUDECODE=${CLAUDECODE-unset}"
+  echo "helper_FM_HOME=$(env_or_unset FM_HOME)"
+  echo "helper_PI_CODING_AGENT=$(env_or_unset PI_CODING_AGENT)"
+  echo "helper_CLAUDECODE=$(env_or_unset CLAUDECODE)"
+} > "$probe"
+if [ -n "$out" ]; then
+  if [ "$kind" = judge ]; then
+    printf '%s\n' '{"verdict":"on_track","summary":"isolated","details":"off the helm"}' > "$out"
+  else
+    printf '%s\n' '- Stay off the Firstmate helm' > "$out"
+  fi
+fi
+exit 0
+"#
+    .replace("#PROBE_DIR#", &probe_dir.path().display().to_string());
+    fs::write(&fake_codex, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_codex, perms).unwrap();
+    }
+
+    let config = home.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+work_root = "{}"
+model_runner = "codex"
+model = "gpt-test"
+min_job_interval_secs = 0
+max_global_jobs = 1
+n_tool_calls = 1
+m_reminder = 9999
+notify_on_off_track = false
+notify_on_warning = false
+notify_on_model_fallback = false
+herdr_report_state = false
+"#,
+            home.path().join("work").display()
+        ),
+    )
+    .unwrap();
+
+    let sid = "cli-firstmate-helm";
+    let firstmate_cwd = "/opt/ra/firstmate/projects/scopey";
+    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
+    let run = |sub: &str, payload: &str| {
+        Command::new(scopey_bin())
+            .args(["hook", sub])
+            .env("SCOPEY_HOME", home.path())
+            .env("SCOPEY_CONFIG", &config)
+            .env_remove("SCOPEY_INTERNAL")
+            .env_remove("SCOPEY_HOOKS_DISABLED")
+            .env("PATH", &path)
+            .env("FM_HOME", fm_home.path())
+            .env("FM_PI_HARNESS", "pi")
+            .env("FIRSTMATE_X", "1")
+            .env("PI_CODING_AGENT", "true")
+            .env("CLAUDECODE", "1")
+            .env("GROK_AGENT", "1")
+            .env("CURSOR_AGENT", "1")
+            .env("CURSOR_INVOKED_AS", "cursor")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(payload.as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("spawn hook")
+    };
+
+    let prompt = format!(
+        r#"{{"session_id":"{sid}","cwd":"{firstmate_cwd}","prompt":"stay on the isolation task","hook_event_name":"UserPromptSubmit"}}"#
+    );
+    let out = run("user-prompt", &prompt);
+    assert!(
+        out.status.success(),
+        "user-prompt stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || summarize_probe.exists()),
+        "summarize helper never invoked fake codex; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let summarize = parse_probe(&fs::read_to_string(&summarize_probe).unwrap());
+    assert_isolated_probe(&summarize, "summarize");
+
+    let store_path = home.path().join("work/by-id").join(format!("{sid}.json"));
+    let job_lock = home.path().join("locks").join(format!("{sid}.job.lock"));
+    assert!(wait_for(Duration::from_secs(10), || {
+        let scoped = fs::read_to_string(&store_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|store| store["messages"].as_array().cloned())
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["type"] == "scope_requirements")
+            });
+        let free = fs::read_to_string(&job_lock)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .map(|lock| lock["pid"].as_u64().unwrap_or(0) == 0)
+            .unwrap_or(true);
+        scoped && free
+    }));
+
+    let tool = format!(
+        r#"{{"session_id":"{sid}","cwd":"{firstmate_cwd}","tool_name":"Read","tool_input":{{"file_path":"README.md"}}}}"#
+    );
+    let out = run("post-tool", &tool);
+    assert!(
+        out.status.success(),
+        "post-tool stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || judge_probe.exists()),
+        "judge helper never invoked fake codex; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let judge = parse_probe(&fs::read_to_string(&judge_probe).unwrap());
+    assert_isolated_probe(&judge, "judge");
+
+    assert!(
+        !isolated_lock.exists(),
+        "isolated Firstmate lock was created at {}",
+        isolated_lock.display()
+    );
+    let live_lock_after = fs::read_to_string(&live_lock).ok();
+    assert_eq!(
+        live_lock_before, live_lock_after,
+        "live Firstmate session lock changed during helper run"
+    );
+    if let Some(holder) = live_lock_after.as_deref() {
+        let holder = holder.trim();
+        for kind in [&summarize, &judge] {
+            assert_ne!(
+                env_get(kind, "child_pid"),
+                holder,
+                "model child holds live lock"
+            );
+            assert_ne!(
+                env_get(kind, "helper_pid"),
+                holder,
+                "helper holds live lock"
+            );
+        }
+    }
+}
